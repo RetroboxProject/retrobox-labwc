@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# Sets up the labwc gaming session for the user running it. The package (or
+# install.sh) only puts the files on the system; what belongs to one user
+# is done here, and is safe to re-run at any time (after an update, or to
+# change the TTY):
+#
+#   * renders the labwc config (rc.xml, autostart, environment) into
+#     ~/.config/labwc with this install's paths and the system keyboard
+#     layout, and links themerc-override
+#   * installs ~/.bashrc.d/64_retrobox, which starts the session when the
+#     autologin shell of the gaming TTY ([advanced] labwc_tty) opens
+#   * lets the user run go2tty (VT switching, which needs root) through sudo
+#     without a password, with a rule for exactly that file
+#   * with --autologin, makes the gaming TTY log the user in by itself
+#
+# Usage: retrobox-labwc-setup [options]
+#   --tty N       use VT N (1-12) as the gaming TTY: writes
+#                 ~/.config/retrobox/retrobox.ini.d/50-labwc.ini
+#   --autologin   also set up autologin on the gaming TTY (systemd getty)
+#   --no-system   only the per-user files: no sudo, nothing under /etc
+#   -u, --uninstall
+#                 undo all of the above for this user
+#   -h, --help
+set -euo pipefail
+
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+readonly SELF
+# shellcheck source=libexec/retrobox-labwc-common.sh
+source "$(dirname -- "${SELF}")/../libexec/retrobox-labwc-common.sh"
+
+readonly LABWC_CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/labwc"
+readonly RETROBOX_CONFIG_DIR="${RETROBOX_CONFIGDIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/retrobox}"
+readonly TTY_DROPIN="${RETROBOX_CONFIG_DIR}/retrobox.ini.d/50-labwc.ini"
+readonly BASHRC_D_DIR="${HOME}/.bashrc.d"
+readonly BASHRC_HOOK="${BASHRC_D_DIR}/64_retrobox"
+readonly GENERATED_MARK="by retrobox-labwc-setup"
+INSTALL_USER="$(id -un)"
+readonly INSTALL_USER
+# sudo ignores sudoers.d files whose name has a dot (or ends in ~)
+readonly SUDOERS_FILE="/etc/sudoers.d/retrobox-labwc-${INSTALL_USER//[^A-Za-z0-9_-]/_}"
+# what the old in-tree installer (retrobox --setup-util labwc-config) left
+readonly LEGACY_SUDOERS_FILE="/etc/sudoers.d/retrobox-go2tty"
+readonly LEGACY_GO2TTY="/usr/local/bin/go2tty"
+readonly AUTOLOGIN_NAME="retrobox-autologin.conf"
+
+# Path-free configs: linked, so updates of the package apply right away.
+readonly LINKED_FILES=("themerc-override")
+# Templates: source:destination in ~/.config/labwc.
+readonly TEMPLATES=("rc.xml.in:rc.xml" "autostart.in:autostart" "environment.in:environment")
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then B=$'\033[1m'; R=$'\033[0m'; else B=""; R=""; fi
+info() { echo "${B}[INFO]${R} $*"; }
+ok() { echo "${B}[ OK ]${R} $*"; }
+warn() { echo "${B}[WARN]${R} $*" >&2; }
+die() {
+  echo "${B}[ERR ]${R} $*" >&2
+  exit 1
+}
+
+usage() { sed -n '2,/^set -euo/p' "${SELF}" | sed '$d; s/^# \{0,1\}//'; }
+
+# ------------------------------------------------------------------ helpers
+# Prints "layout variant" from the system keyboard settings (default: us).
+detect_xkb() {
+  local layout="" variant=""
+  local status
+  # (localectl fails without a running systemd: that is no error here)
+  if status="$(localectl status 2>/dev/null)"; then
+    layout="$(awk -F': *' '/X11 Layout/ {print $2}' <<<"${status}")"
+    variant="$(awk -F': *' '/X11 Variant/ {print $2}' <<<"${status}")"
+  fi
+  if [[ -z "${layout}" && -r /etc/default/keyboard ]]; then
+    layout="$(sed -n 's/^XKBLAYOUT="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/default/keyboard)"
+    variant="$(sed -n 's/^XKBVARIANT="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/default/keyboard)"
+  fi
+  printf '%s %s\n' "${layout:-us}" "${variant}"
+}
+
+# Escapes a string for the replacement side of a sed s||| expression.
+sed_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//|/\\|}"
+  printf '%s' "${value//&/\\&}"
+}
+
+# render TEMPLATE DESTINATION: fills in the @...@ placeholders of this
+# install (and nothing else: rc.xml has wpctl's own @DEFAULT_AUDIO_SINK@).
+render() {
+  sed -e "s|@LABWC_DIR@|$(sed_escape "${RETROBOX_LABWC_DIR}")|g" \
+    -e "s|@SCREENSHOT_CMD@|$(sed_escape "${SCREENSHOT_CMD}")|g" \
+    -e "s|@XKB_LAYOUT@|$(sed_escape "${XKB_LAYOUT}")|g" \
+    -e "s|@XKB_VARIANT@|$(sed_escape "${XKB_VARIANT}")|g" \
+    "$1" >"$2"
+}
+
+# Moves aside a file we are about to replace unless we generated it.
+backup_foreign() {
+  local file="$1"
+  if [[ -f "${file}" && ! -L "${file}" ]] && ! grep -qF "${GENERATED_MARK}" "${file}"; then
+    local backup
+    backup="${file}.bak-$(date +%Y%m%d%H%M%S)"
+    mv -- "${file}" "${backup}"
+    warn "Kept your own $(basename -- "${file}") as ${backup}"
+  fi
+}
+
+# True if PATH and every directory above it belong to root and nobody else
+# can write to them: only then may sudo run it without a password (anyone
+# able to change the file would otherwise get root).
+root_owned_chain() {
+  local path="$1"
+  while :; do
+    [[ -e "${path}" ]] || return 1
+    [[ "$(stat -Lc '%u' -- "${path}")" == "0" ]] || return 1
+    # group/other write bits (a sticky dir like /tmp would not help either)
+    (($(stat -Lc '0%a' -- "${path}") & 022)) && return 1
+    [[ "${path}" == "/" ]] && return 0
+    path="$(dirname -- "${path}")"
+  done
+}
+
+has_nopasswd_go2tty() {
+  sudo -n -l -U "${INSTALL_USER}" 2>/dev/null | grep -qF "NOPASSWD: ${RETROBOX_GO2TTY}"
+}
+
+# -------------------------------------------------------------- user files
+install_user_files() {
+  local root pair name
+
+  if root="$(find_retrobox_root)"; then
+    info "retrobox-core found in ${root}"
+  else
+    warn "retrobox-core not found: the session will not start until it is installed."
+  fi
+  if [[ -n "${root}" && -x "${root}/bin/retrobox-screenshot" ]]; then
+    SCREENSHOT_CMD="${root}/bin/retrobox-screenshot"
+  else
+    SCREENSHOT_CMD="retrobox-screenshot"
+  fi
+  read -r XKB_LAYOUT XKB_VARIANT < <(detect_xkb) || true
+  XKB_VARIANT="${XKB_VARIANT:-}"
+
+  info "Writing the labwc config to ${LABWC_CONFIG_DIR} (keyboard: ${XKB_LAYOUT}${XKB_VARIANT:+ ${XKB_VARIANT}})..."
+  mkdir -p -- "${LABWC_CONFIG_DIR}"
+  for name in "${LINKED_FILES[@]}"; do
+    backup_foreign "${LABWC_CONFIG_DIR}/${name}"
+    ln -sfn -- "${RETROBOX_LABWC_DIR}/share/labwc/${name}" "${LABWC_CONFIG_DIR}/${name}"
+  done
+  for pair in "${TEMPLATES[@]}"; do
+    name="${pair##*:}"
+    backup_foreign "${LABWC_CONFIG_DIR}/${name}"
+    # a leftover symlink from an older install would be followed
+    rm -f -- "${LABWC_CONFIG_DIR}/${name}"
+    render "${RETROBOX_LABWC_DIR}/share/labwc/${pair%%:*}" "${LABWC_CONFIG_DIR}/${name}"
+  done
+
+  info "Installing the session hook at ${BASHRC_HOOK}..."
+  mkdir -p -- "${BASHRC_D_DIR}"
+  rm -f -- "${BASHRC_HOOK}"
+  render "${RETROBOX_LABWC_DIR}/share/bashrc-hook.in" "${BASHRC_HOOK}"
+  # executable: some ~/.bashrc.d loaders only pick up executable fragments
+  chmod 755 -- "${BASHRC_HOOK}"
+  if ! grep -qs '\.bashrc\.d' "${HOME}/.bashrc"; then
+    warn "${HOME}/.bashrc doesn't source ~/.bashrc.d (Debian's default doesn't); add:"
+    warn "  for f in \"\${HOME}\"/.bashrc.d/*; do [ -r \"\${f}\" ] && . \"\${f}\"; done"
+  fi
+}
+
+set_tty() {
+  is_valid_tty "$1" || die "--tty needs a VT number between 1 and 12"
+  info "Gaming TTY: ${1} (${TTY_DROPIN})"
+  mkdir -p -- "$(dirname -- "${TTY_DROPIN}")"
+  printf '# Written %s.\n[advanced]\nlabwc_tty = %s\n' "${GENERATED_MARK}" "$((10#$1))" >"${TTY_DROPIN}"
+}
+
+# ------------------------------------------------------------ system parts
+remove_legacy() {
+  # go2tty used to be a symlink into a retrobox-core checkout (share/labwc).
+  if [[ -L "${LEGACY_GO2TTY}" && "$(readlink -- "${LEGACY_GO2TTY}")" == */share/labwc/go2tty ]]; then
+    info "Removing the old ${LEGACY_GO2TTY} link..."
+    sudo rm -f -- "${LEGACY_GO2TTY}"
+  fi
+  if sudo test -e "${LEGACY_SUDOERS_FILE}"; then
+    info "Removing the old ${LEGACY_SUDOERS_FILE}..."
+    sudo rm -f -- "${LEGACY_SUDOERS_FILE}"
+  fi
+}
+
+install_sudoers_rule() {
+  if ! root_owned_chain "${RETROBOX_GO2TTY}"; then
+    warn "${RETROBOX_GO2TTY} can be changed by non-root users (a per-user or"
+    warn "git-checkout install): no passwordless rule for it, as that would hand out"
+    warn "root. Switching TTYs will ask for your password."
+    return 0
+  fi
+  if has_nopasswd_go2tty; then
+    info "${INSTALL_USER} can already run go2tty through sudo without a password."
+    return 0
+  fi
+
+  info "Letting ${INSTALL_USER} run go2tty through sudo without a password..."
+  local tmp
+  tmp="$(mktemp)"
+  printf '# Written %s: VT switching for the labwc gaming session.\n%s ALL=(root) NOPASSWD: %s\n' \
+    "${GENERATED_MARK}" "${INSTALL_USER}" "${RETROBOX_GO2TTY}" >"${tmp}"
+  if ! sudo visudo -cf "${tmp}" >/dev/null 2>&1; then
+    rm -f -- "${tmp}"
+    warn "The sudoers rule did not validate; not installing it."
+    return 1
+  fi
+  sudo install -o root -g root -m 0440 -- "${tmp}" "${SUDOERS_FILE}"
+  rm -f -- "${tmp}"
+}
+
+reload_systemd() {
+  # (nothing to reload without a running systemd, e.g. in a container)
+  [[ -d /run/systemd/system ]] && sudo systemctl daemon-reload
+  return 0
+}
+
+autologin_dropin() {
+  printf '/etc/systemd/system/getty@tty%s.service.d/%s\n' "$1" "${AUTOLOGIN_NAME}"
+}
+
+install_autologin() {
+  local tty agetty dropin tmp
+  tty="$(get_gaming_tty)" || die "set the gaming TTY first (--tty N)"
+  agetty="$(command -v agetty || true)"
+  [[ -n "${agetty}" ]] || agetty="$(PATH="/usr/sbin:/sbin:${PATH}" command -v agetty || true)"
+  [[ -n "${agetty}" ]] || die "agetty not found"
+  dropin="$(autologin_dropin "${tty}")"
+
+  info "Autologin of ${INSTALL_USER} on tty${tty} (${dropin})..."
+  tmp="$(mktemp)"
+  cat >"${tmp}" <<EOF
+# Written ${GENERATED_MARK}: the labwc gaming session starts from this login.
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=
+ExecStart=-${agetty} --autologin ${INSTALL_USER} --noclear %I \$TERM
+EOF
+  sudo mkdir -p -- "$(dirname -- "${dropin}")"
+  sudo install -o root -g root -m 0644 -- "${tmp}" "${dropin}"
+  rm -f -- "${tmp}"
+  reload_systemd
+}
+
+# --------------------------------------------------------------- uninstall
+uninstall() {
+  local pair name dropin
+
+  info "Removing the labwc config written by this script..."
+  for name in "${LINKED_FILES[@]}"; do
+    [[ -L "${LABWC_CONFIG_DIR}/${name}" ]] && rm -f -- "${LABWC_CONFIG_DIR}/${name}"
+  done
+  for pair in "${TEMPLATES[@]}"; do
+    name="${LABWC_CONFIG_DIR}/${pair##*:}"
+    grep -qsF "${GENERATED_MARK}" "${name}" && rm -f -- "${name}"
+  done
+  rm -f -- "${BASHRC_HOOK}"
+  grep -qsF "${GENERATED_MARK}" "${TTY_DROPIN}" && rm -f -- "${TTY_DROPIN}"
+
+  if ((SYSTEM == 1)); then
+    for dropin in /etc/systemd/system/getty@tty*.service.d/"${AUTOLOGIN_NAME}"; do
+      [[ -e "${dropin}" ]] || continue
+      grep -qsF -- "--autologin ${INSTALL_USER} " "${dropin}" || continue
+      info "Removing ${dropin}..."
+      sudo rm -f -- "${dropin}"
+      sudo rmdir --ignore-fail-on-non-empty -- "$(dirname -- "${dropin}")"
+      reload_systemd
+    done
+    if sudo test -e "${SUDOERS_FILE}"; then
+      info "Removing ${SUDOERS_FILE}..."
+      sudo rm -f -- "${SUDOERS_FILE}"
+    fi
+  fi
+  ok "Done. Files you edited yourself (anything without the generated mark) were left alone."
+}
+
+# -------------------------------------------------------------------- main
+TTY_ARG=""
+AUTOLOGIN=0
+SYSTEM=1
+UNINSTALL=0
+while (($# > 0)); do
+  case "$1" in
+    --tty)
+      TTY_ARG="${2:?--tty needs a VT number}"
+      shift 2
+      ;;
+    --autologin)
+      AUTOLOGIN=1
+      shift
+      ;;
+    --no-system)
+      SYSTEM=0
+      shift
+      ;;
+    -u | --uninstall)
+      UNINSTALL=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *) die "unknown option: $1 (see --help)" ;;
+  esac
+done
+
+((EUID != 0)) || die "run it as the user who plays, not as root (it uses sudo when needed)"
+
+if ((UNINSTALL == 1)); then
+  uninstall
+  exit 0
+fi
+
+[[ -n "${TTY_ARG}" ]] && set_tty "${TTY_ARG}"
+install_user_files
+
+if ((SYSTEM == 1)); then
+  command -v sudo >/dev/null 2>&1 || die "sudo is needed for the system parts (or use --no-system)"
+  remove_legacy
+  install_sudoers_rule
+  ((AUTOLOGIN == 1)) && install_autologin
+elif ((AUTOLOGIN == 1)); then
+  warn "--autologin ignored with --no-system"
+fi
+
+if tty="$(get_gaming_tty 2>/dev/null)"; then
+  ok "Ready: run retrobox-enter-tty to play on tty${tty}."
+  if ((AUTOLOGIN == 0)) && [[ ! -e "$(autologin_dropin "${tty}")" ]]; then
+    warn "tty${tty} has no autologin yet: re-run with --autologin (or set it up yourself)."
+  fi
+else
+  warn "No gaming TTY set: re-run with --tty N (e.g. --tty 8)."
+fi

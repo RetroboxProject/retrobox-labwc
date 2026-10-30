@@ -1,0 +1,11 @@
+# Runtime dependencies for Fedora (dnf package names; a path means "whatever
+# package provides it"). One per line.
+labwc
+/usr/bin/dbus-run-session
+wlr-randr
+wireplumber
+pulseaudio-utils
+kbd
+procps-ng
+sudo
+util-linux

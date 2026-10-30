@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        echo "retrobox-labwc: each user runs 'retrobox-labwc-setup --tty N --autologin' once"
+        echo "retrobox-labwc: (and again after an upgrade, to refresh ~/.config/labwc)."
+        ;;
+esac
+
+exit 0

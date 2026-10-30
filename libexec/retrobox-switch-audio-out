@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Moves the default audio sink between the external screen (HDMI /
+# DisplayPort) and the internal speakers.
+#
+# Usage: retrobox-switch-audio-out [external|internal|toggle]
+#   (hdmi and laptop are accepted as aliases; no argument means toggle)
+#
+# The sinks are found by name: the first one with "hdmi" or "displayport" in
+# it is the external one, the first other one is the internal one. Set them
+# in retrobox.ini when that guess is wrong (names from `pactl list short
+# sinks`):
+#   [labwc]
+#   external_sink = alsa_output.pci-0000_01_00.1.hdmi-stereo
+#   internal_sink = alsa_output.pci-0000_05_00.6.analog-stereo
+set -euo pipefail
+
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+readonly SELF
+# shellcheck source=libexec/retrobox-labwc-common.sh
+source "$(dirname -- "${SELF}")/retrobox-labwc-common.sh"
+
+usage() {
+  echo "usage: $(basename "$0") [external|internal|toggle]" >&2
+  exit 1
+}
+
+(($# > 1)) && usage
+
+sinks="$(pactl list short sinks | awk '{print $2}')"
+external="$(get_retrobox_setting labwc external_sink ||
+  grep -iE 'hdmi|displayport' <<<"${sinks}" | head -n1 || true)"
+internal="$(get_retrobox_setting labwc internal_sink ||
+  grep -viE 'hdmi|displayport' <<<"${sinks}" | head -n1 || true)"
+
+case "${1:-toggle}" in
+  external | hdmi) target="${external}" ;;
+  internal | laptop) target="${internal}" ;;
+  toggle)
+    if [[ "$(pactl get-default-sink)" == "${external}" ]]; then
+      target="${internal}"
+    else
+      target="${external}"
+    fi
+    ;;
+  *) usage ;;
+esac
+
+if [[ -z "${target}" ]]; then
+  echo "error: no such audio sink here (see [labwc] in retrobox.ini)" >&2
+  exit 1
+fi
+pactl set-default-sink "${target}"

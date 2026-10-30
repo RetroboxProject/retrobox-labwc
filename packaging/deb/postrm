@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+# On purge, drop what retrobox-labwc-setup added to /etc for every user (it is
+# useless without the package). Each user's ~/.config/labwc and
+# ~/.bashrc.d/64_retrobox are left alone: the hook does nothing without the
+# package.
+case "$1" in
+    purge)
+        rm -f /etc/sudoers.d/retrobox-labwc-*
+        for dropin in /etc/systemd/system/getty@tty*.service.d/retrobox-autologin.conf; do
+            [ -e "${dropin}" ] || continue
+            rm -f "${dropin}"
+            rmdir "$(dirname "${dropin}")" 2>/dev/null || true
+        done
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+exit 0

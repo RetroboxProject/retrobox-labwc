@@ -1,0 +1,21 @@
+Package: retrobox-labwc
+Version: @VERSION@
+Section: games
+Priority: optional
+Architecture: all
+Installed-Size: @INSTALLED_SIZE@
+Maintainer: Manu Romero <manu4.2012@gmail.com>
+Homepage: https://github.com/RetroboxProject/retrobox-labwc
+Depends: retrobox-core, @DEPENDS@
+Recommends: @RECOMMENDS@
+Description: Retrobox labwc gaming session on its own TTY
+ Runs Retrobox inside a labwc Wayland session on a dedicated virtual
+ terminal, isolated from the desktop session (its own D-Bus session):
+ retrobox-enter-tty switches to it from the desktop, Win+D goes back, and
+ the session closes itself when Retrobox exits. Includes display and audio
+ output switching (Win+P, Win+O) and the labwc configuration it needs.
+ .
+ Installed under /opt/retrobox/labwc. Each user then runs
+ retrobox-labwc-setup once to write their labwc configuration, the
+ ~/.bashrc.d hook that starts the session and, through sudo, the rules for
+ switching TTYs and logging in automatically.

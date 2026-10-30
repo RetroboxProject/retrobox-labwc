@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Picks the display output of the gaming session (run by labwc's autostart
+# and by the Win+P keybind), and moves the audio along with it.
+#
+#   * no external screen connected  -> internal panel only
+#   * only the external one is on   -> back to the internal panel
+#   * otherwise                     -> external screen only
+#
+# The internal panel is the first eDP/LVDS/DSI output and the external one
+# the first other output, as listed by wlr-randr. Set them in retrobox.ini
+# when that guess is wrong:
+#   [labwc]
+#   internal_output = eDP-1
+#   external_output = HDMI-A-1
+#
+# Usage: retrobox-switch-display [toggle]
+set -euo pipefail
+
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+readonly SELF
+SCRIPT_DIR="$(dirname -- "${SELF}")"
+readonly SCRIPT_DIR
+# shellcheck source=libexec/retrobox-labwc-common.sh
+source "${SCRIPT_DIR}/retrobox-labwc-common.sh"
+
+if (($# > 1)) || [[ -n "${1:-}" && "$1" != "toggle" ]]; then
+  echo "usage: $(basename "$0") [toggle]" >&2
+  exit 1
+fi
+
+output="$(wlr-randr)"
+# Output names: the unindented lines ("HDMI-A-1 "Make Model (HDMI-A-1)"").
+names="$(awk '/^[^[:space:]]/ {print $1}' <<<"${output}")"
+
+internal="$(get_retrobox_setting labwc internal_output ||
+  grep -E '^(eDP|LVDS|DSI)' <<<"${names}" | head -n1 || true)"
+external="$(get_retrobox_setting labwc external_output ||
+  grep -vxF -- "${internal:-}" <<<"${names}" | head -n1 || true)"
+
+# True if the output in $1 is connected.
+connected() {
+  [[ -n "$1" ]] && grep -qxF -- "$1" <<<"${names}"
+}
+
+# Prints "yes" or "no" for the output in $1.
+is_enabled() {
+  awk -v mon="$1" '
+    $1 == mon && /^[^[:space:]]/ { found = 1; next }
+    found && /^[^[:space:]]/ { exit }
+    found && /Enabled:/ { print $2; exit }
+  ' <<<"${output}"
+}
+
+use_internal() {
+  if connected "${external}"; then wlr-randr --output "${external}" --off; fi
+  wlr-randr --output "${internal}" --on --preferred --pos 0,0
+  "${SCRIPT_DIR}/retrobox-switch-audio-out" internal || true
+}
+
+use_external() {
+  if connected "${internal}"; then wlr-randr --output "${internal}" --off; fi
+  wlr-randr --output "${external}" --on --preferred --pos 0,0
+  # give the screen time to bring its audio device up
+  sleep 3
+  "${SCRIPT_DIR}/retrobox-switch-audio-out" external || true
+}
+
+if ! connected "${external}"; then
+  if connected "${internal}"; then use_internal; fi
+  exit 0
+fi
+if ! connected "${internal}"; then
+  use_external
+  exit 0
+fi
+
+if [[ "$(is_enabled "${external}")" == "yes" && "$(is_enabled "${internal}")" == "no" ]]; then
+  use_internal
+else
+  use_external
+fi

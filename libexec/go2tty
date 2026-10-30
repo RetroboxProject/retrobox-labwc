@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# chvt wrapper that also starts/stops the gaming TTY's getty on the way in
+# and out of the gaming session. Runs as root: retrobox-labwc-setup grants
+# the user passwordless sudo for exactly this file (by its real path), which
+# is why it must live in a root-owned tree.
+#
+# Starting the gaming TTY's getty is what boots the session: the autologin
+# shell sources ~/.bashrc.d/64_retrobox, which execs retrobox-labwc-session
+# on that TTY.
+#
+# Usage: go2tty [-n] [-h] TTY
+#   TTY   Target VT number (1-12)
+#   -n    Don't stop the gaming TTY's getty when leaving it
+#   -h    Show this help
+set -euo pipefail
+
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+readonly SELF
+# shellcheck source=libexec/retrobox-labwc-common.sh
+source "$(dirname -- "${SELF}")/retrobox-labwc-common.sh"
+
+usage() {
+  cat <<USAGE
+Usage: $(basename "$0") [-n] [-h] TTY
+
+  TTY   Target VT number (1-12)
+  -n    Don't stop the gaming TTY's getty when leaving it
+  -h    Show this help
+USAGE
+}
+
+# Re-exec under sudo if not already root (by the exact path in sudoers).
+if ((EUID != 0)); then
+  exec sudo "${SELF}" "$@"
+fi
+
+no_stop=0
+
+while getopts ":nh" opt; do
+  case "${opt}" in
+    n) no_stop=1 ;;
+    h)
+      usage
+      exit 0
+      ;;
+    \?)
+      echo "Invalid option: -${OPTARG}" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if (($# != 1)); then
+  usage
+  exit 1
+fi
+
+if ! is_valid_tty "$1"; then
+  echo "Invalid TTY: $1" >&2
+  usage
+  exit 1
+fi
+readonly TARGET_TTY="$((10#$1))"
+
+# The invoking user's retrobox.ini decides which TTY is the gaming one.
+GAMING_TTY="$(get_gaming_tty)" || exit 1
+readonly GAMING_TTY
+readonly GETTY="getty@tty${GAMING_TTY}.service"
+
+# Entering the gaming TTY: make sure its getty is running (its autologin
+# shell starts the session). Autologin itself is set up once with
+# `retrobox-labwc-setup --autologin`.
+if ((TARGET_TTY == GAMING_TTY)); then
+  systemctl is-active --quiet "${GETTY}" || systemctl start "${GETTY}"
+  chvt "${TARGET_TTY}"
+else
+  chvt "${TARGET_TTY}"
+  if ((no_stop == 0)); then
+    # Stopping the getty tears down the autologin shell (and with it the
+    # finished session) so it is not respawned on the gaming TTY.
+    if systemctl is-active --quiet "${GETTY}"; then
+      systemctl stop "${GETTY}"
+    fi
+  fi
+fi
+
+exit 0

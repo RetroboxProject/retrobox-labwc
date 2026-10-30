@@ -1,0 +1,14 @@
+# Runtime dependencies for Debian, Ubuntu and derivatives (apt package names).
+# Single source: the .deb's Depends is built from it and install.sh installs
+# it. One package per line; "a | b" = either. retrobox-core itself is not
+# listed: the .deb depends on it separately, install.sh is run by (or after)
+# retrobox-core's own installer.
+labwc
+dbus-bin | dbus
+wlr-randr
+wireplumber
+pulseaudio-utils
+kbd
+procps
+sudo
+util-linux

@@ -1,0 +1,187 @@
+name: Build packages
+
+# Builds retrobox-labwc_<version>_all.deb, retrobox-labwc-<version>-1.noarch.rpm
+# and retrobox-labwc-all.tar.gz (the payload of install.sh), tests them on
+# Ubuntu 24.04, Debian 13 and Fedora and, for tags like v1.2.3, publishes them
+# (plus install.sh and SHA256SUMS) as a GitHub Release. Everything is shell
+# scripts, so one architecture-independent package of each kind serves every
+# machine.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -x -S warning install.sh bin/* libexec/* packaging/*.sh \
+            packaging/deb/*.sh packaging/deb/postinst packaging/deb/postrm \
+            packaging/rpm/*.sh packaging/tarball/*.sh
+
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out (full history, for version detection)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build the .deb
+        run: packaging/deb/build-deb.sh --outdir dist
+
+      - name: Build the .rpm
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rpm
+          packaging/rpm/build-rpm.sh --outdir dist
+
+      - name: Build the install.sh tarball
+        run: packaging/tarball/build-tarball.sh --outdir dist
+
+      - name: Copy install.sh next to it
+        run: cp install.sh dist/install.sh
+
+      - name: Generate SHA256SUMS for every release asset
+        run: |
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum *.deb *.rpm retrobox-labwc-all.tar.gz install.sh > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Show package contents
+        run: |
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb
+          rpm -qlp --requires dist/*.rpm
+
+      - name: Upload the packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrobox-labwc-dist
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/retrobox-labwc-all.tar.gz
+            dist/SHA256SUMS
+            dist/install.sh
+          if-no-files-found: error
+
+  smoke-test:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:24.04", "debian:trixie", "fedora:latest", "fedora:42"]
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install git (for the sparse checkout)
+        run: |
+          if command -v dnf >/dev/null; then dnf install -y -q git
+          else apt-get update -qq && apt-get install -y -qq git; fi
+
+      - name: Check out (for the test script only)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: packaging/smoke-test.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Download the packages
+        uses: actions/download-artifact@v4
+        with:
+          name: retrobox-labwc-dist
+          path: dist
+
+      - name: Install, test and remove the package
+        run: |
+          if command -v dnf >/dev/null; then bash packaging/smoke-test.sh dist/*.rpm
+          else bash packaging/smoke-test.sh dist/*.deb; fi
+
+  install-test:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:24.04", "debian:trixie", "fedora:latest"]
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    steps:
+      - name: Download the packages
+        uses: actions/download-artifact@v4
+        with:
+          name: retrobox-labwc-dist
+          path: dist
+
+      - name: install.sh next to a script-installed retrobox-core, then uninstall
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update -qq
+            apt-get install -y -qq curl ca-certificates
+          else
+            dnf install -y -q curl
+          fi
+          # stand-in for a retrobox-core installed by its install.sh
+          mkdir -p /opt/retrobox/bin
+          printf '#!/bin/sh\necho stub\n' > /opt/retrobox/bin/retrobox
+          chmod 755 /opt/retrobox/bin/retrobox
+          ln -s /opt/retrobox/bin/retrobox /usr/local/bin/retrobox
+          echo /usr/local/bin/retrobox > /opt/retrobox/.install-manifest
+
+          bash dist/install.sh --tarball dist/retrobox-labwc-all.tar.gz
+          test -x /opt/retrobox/labwc/libexec/go2tty
+          test -L /usr/local/bin/retrobox-labwc-setup
+          test -f /opt/retrobox/.components/labwc/install.sh
+          retrobox-labwc-setup --help | head -3
+
+          # what retrobox-core's installer does for `--with labwc` on update
+          RETROBOX_PREFIX=/opt/retrobox RETROBOX_BIN_DIR=/usr/local/bin RETROBOX_ARCH=amd64 \
+            bash /opt/retrobox/.components/labwc/install.sh --prefix /opt/retrobox \
+            --bin-dir /usr/local/bin --no-deps --tarball dist/retrobox-labwc-all.tar.gz
+
+          bash dist/install.sh --uninstall
+          test ! -e /opt/retrobox/labwc
+          test ! -e /usr/local/bin/retrobox-labwc-setup
+          test ! -e /opt/retrobox/.components/labwc
+          test -x /opt/retrobox/bin/retrobox
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, build, smoke-test, install-test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download the packages
+        uses: actions/download-artifact@v4
+        with:
+          name: retrobox-labwc-dist
+          path: dist
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" dist/* --repo "$REPO" --title "$TAG" --generate-notes
+          fi
