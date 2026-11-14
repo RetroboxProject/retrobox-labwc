@@ -1,4 +1,4 @@
-# Generated from autostart.in by retrobox-labwc-setup - do not edit (re-run it instead).
+# Generated from autostart.in by retrobox-labwc - do not edit (re-run `retrobox-labwc install` instead).
 
 # Report the environment labwc sets up for its children to
 # retrobox-labwc-session, which starts retrobox outside labwc's process
@@ -9,6 +9,11 @@ if [ -n "${RETROBOX_LABWC_ENV_FILE:-}" ]; then
     >"${RETROBOX_LABWC_ENV_FILE}.tmp" &&
     mv "${RETROBOX_LABWC_ENV_FILE}.tmp" "${RETROBOX_LABWC_ENV_FILE}"
 fi
+
+# Audio: normally pipewire-pulse is started on demand by the user's systemd,
+# but nothing else on a minimal system makes sure of it. Harmless if it is
+# already running (or if there is no systemd user manager).
+systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber.service >/dev/null 2>&1 &
 
 # Pick the active display output for the gaming session.
 @LABWC_DIR@/libexec/retrobox-switch-display &

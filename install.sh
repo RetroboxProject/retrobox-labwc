@@ -1,291 +1,538 @@
 #!/usr/bin/env bash
-# retrobox-labwc installer: puts the labwc gaming session next to an
-# existing retrobox-core installed with its own install.sh (the .deb/.rpm
-# packages need no script). Two ways to run it:
+# retrobox-labwc: user-level installer of the labwc gaming session for
+# minimal systems (Debian netinstall, Arch, ...). It needs no root and
+# installs no packages: it CHECKS that what the session needs is there and
+# sets up everything else inside your home.
 #
-#   * from retrobox-core's installer, as one of its components:
-#       curl -fsSL https://github.com/RetroboxProject/retrobox-core/releases/latest/download/install.sh | bash -s -- --with labwc
-#     which also brings it back on every core update and removes it with
-#     the core (see "Components" in that script);
-#   * on its own, after retrobox-core:
-#       curl -fsSL https://raw.githubusercontent.com/RetroboxProject/retrobox-labwc/HEAD/install.sh | bash -s -- --setup -- --tty 8 --autologin
+# It checks:
+#   * labwc, pipewire-pulse and a terminal (foot or alacritty) are installed
+#     (also dbus-run-session, which the session needs; the rest is advice)
+#   * the gaming TTY logs your user in by itself (systemd getty autologin)
 #
-# Options:
-#   --prefix DIR      retrobox-core's install prefix; this goes to DIR/labwc
-#                     (default: where the `retrobox` command points, else
-#                     /opt/retrobox)
-#   --bin-dir DIR     where the commands are linked (default /usr/local/bin,
-#                     ~/.local/bin with --user)
-#   --user            no root: everything under $HOME (no passwordless TTY
-#                     switching then: go2tty must be root-owned for that)
-#   --version X.Y.Z   install that release instead of the latest
-#   --tarball FILE    install from a local retrobox-labwc-all.tar.gz
-#                     (or RETROBOX_LABWC_TARBALL=FILE in the environment,
-#                     handy through retrobox-core's installer)
-#   --base-url URL    download from URL instead of the GitHub release
-#                     (or RETROBOX_LABWC_BASE_URL=URL)
-#   --no-deps         don't install system dependencies
-#   --setup [-- ARGS] then run retrobox-labwc-setup ARGS as the user who
-#                     plays (the one behind sudo, if any)
-#   --uninstall       remove what this script installed
+# It sets up, in your home only:
+#   * ~/.local/share/retrobox-labwc    this tree (so the checkout can go)
+#   * ~/.config/retrobox-labwc         labwc's config for the session
+#   * ~/.config/retrobox/retrobox.ini.d/50-labwc.ini   the gaming TTY
+#   * a block in your login profile (~/.bash_profile, ~/.bash_login or
+#     ~/.profile) that starts the session on the gaming TTY
+#
+# The keyboard is always the system's (/etc/default/keyboard on Debian,
+# localectl elsewhere), read every time the session starts. After changing
+# it (Debian: sudo dpkg-reconfigure keyboard-configuration) press
+# Win+Shift+R in the session, or log in again.
+#
+# Once installed, the TTY cannot be changed: uninstall first, then install.
+#
+# Usage: ./install.sh [--tty N] [--force]
+#        ./install.sh --check [--tty N]
+#        ./install.sh --uninstall
+#   --tty N       gaming TTY (1-12); required the first time
+#   --check       only run the checks, change nothing
+#   --force       install even if a check fails
+#   --uninstall   remove everything this script set up (nothing under /etc)
 #   -h, --help
-#
-# After installing, every user who plays runs retrobox-labwc-setup once
-# (--setup does it for you).
 set -euo pipefail
 
-REPO="RetroboxProject/retrobox-labwc"
-ASSET="retrobox-labwc-all.tar.gz"
-NAME="labwc"
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+readonly SELF
+SELF_DIR="$(dirname -- "${SELF}")"
+readonly SELF_DIR
+# shellcheck source=libexec/retrobox-labwc-common.sh
+source "${SELF_DIR}/libexec/retrobox-labwc-common.sh"
 
-PREFIX="${RETROBOX_PREFIX:-}"
-BIN_DIR="${RETROBOX_BIN_DIR:-}"
-USER_MODE=0
-VERSION=""
-TARBALL="${RETROBOX_LABWC_TARBALL:-}"
-BASE_URL="${RETROBOX_LABWC_BASE_URL:-}"
-DO_DEPS=1
-UNINSTALL=0
-SETUP=0
-declare -a SETUP_ARGS=()
-# retrobox-core's installer passes RETROBOX_PREFIX: it then owns the
-# component bookkeeping (<prefix>/.components/labwc).
-CALLED_BY_CORE=0
-[[ -n "${RETROBOX_PREFIX:-}" ]] && CALLED_BY_CORE=1
+readonly GENERATED_MARK="by retrobox-labwc"
+readonly BLOCK_BEGIN="# >>> retrobox-labwc (managed by its install.sh; removed by --uninstall) >>>"
+readonly BLOCK_END="# <<< retrobox-labwc <<<"
+readonly DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/retrobox-labwc"
+readonly CONFIG_DIR="${RETROBOX_LABWC_CONFIG_DIR}"
+readonly RETROBOX_CONFIG_DIR="${RETROBOX_CONFIGDIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/retrobox}"
+readonly TTY_DROPIN="${RETROBOX_CONFIG_DIR}/retrobox.ini.d/50-labwc.ini"
+readonly MANIFEST="${DATA_DIR}/.install-manifest"
+readonly BIN_DIR="${HOME}/.local/bin"
+readonly SESSION_LINK="${BIN_DIR}/retrobox-labwc-session"
+readonly OS_RELEASE="${RETROBOX_OS_RELEASE:-/etc/os-release}"
+# the files bash reads for a login shell, in the order it tries them
+readonly PROFILES=(".bash_profile" ".bash_login" ".profile")
+# what is copied into DATA_DIR
+readonly TREE=(install.sh bin libexec share)
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then B=$'\033[1m'; R=$'\033[0m'; else B=""; R=""; fi
-info() { echo "${B}[INFO]${R} retrobox-labwc: $*"; }
-ok()   { echo "${B}[ OK ]${R} retrobox-labwc: $*"; }
-warn() { echo "${B}[WARN]${R} retrobox-labwc: $*" >&2; }
-die()  { echo "${B}[ERR ]${R} retrobox-labwc: $*" >&2; exit 1; }
-
-usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]:-$0}" 2>/dev/null | sed '$d; s/^# \{0,1\}//'; }
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --prefix)    PREFIX="${2:?--prefix needs a directory}"; shift 2 ;;
-        --bin-dir)   BIN_DIR="${2:?--bin-dir needs a directory}"; shift 2 ;;
-        --user)      USER_MODE=1; shift ;;
-        --version)   VERSION="${2:?--version needs a value}"; shift 2 ;;
-        --tarball)   TARBALL="${2:?--tarball needs a file}"; shift 2 ;;
-        --base-url)  BASE_URL="${2:?--base-url needs a URL}"; shift 2 ;;
-        --no-deps)   DO_DEPS=0; shift ;;
-        --setup)     SETUP=1; shift ;;
-        --uninstall) UNINSTALL=1; shift ;;
-        --)          shift; SETUP_ARGS=("$@"); break ;;
-        -h|--help)   usage; exit 0 ;;
-        *) die "unknown option: $1 (see --help)" ;;
-    esac
-done
-
-[[ "$(uname -s)" == "Linux" ]] || die "Linux only."
-
-# --- privileges --------------------------------------------------------------
-if [[ "${USER_MODE}" -eq 1 ]]; then
-    priv() { "$@"; }
-    HAVE_ROOT=0
-elif [[ "${EUID}" -eq 0 ]]; then
-    priv() { "$@"; }
-    HAVE_ROOT=1
-elif command -v sudo >/dev/null 2>&1; then
-    priv() { sudo "$@"; }
-    HAVE_ROOT=1
-else
-    die "Not root and no sudo available: use --user."
-fi
-
-# --- layout -------------------------------------------------------------------
-# retrobox-core's prefix: where its `retrobox` command points to.
-core_prefix() {
-    local cmd dir
-    cmd="$(command -v retrobox 2>/dev/null)" || return 1
-    dir="$(dirname "$(dirname "$(readlink -f "${cmd}")")")"
-    [[ -x "${dir}/bin/retrobox" ]] && echo "${dir}"
+info() { echo "${B}[INFO]${R} $*"; }
+ok() { echo "${B}[ OK ]${R} $*"; }
+warn() { echo "${B}[WARN]${R} $*" >&2; }
+bad() { echo "${B}[MISS]${R} $*" >&2; }
+die() {
+  echo "${B}[ERR ]${R} $*" >&2
+  exit 1
 }
 
-if [[ -z "${PREFIX}" ]]; then
-    if ! PREFIX="$(core_prefix)"; then
-        if [[ "${USER_MODE}" -eq 1 ]]; then PREFIX="${HOME}/.local/opt/retrobox"
-        elif [[ -d /var/opt/retrobox && ! -d /opt/retrobox ]]; then PREFIX="/var/opt/retrobox"
-        else PREFIX="/opt/retrobox"; fi
-    fi
-fi
-if [[ -z "${BIN_DIR}" ]]; then
-    if [[ "${USER_MODE}" -eq 1 ]]; then BIN_DIR="${HOME}/.local/bin"; else BIN_DIR="/usr/local/bin"; fi
-fi
-PREFIX="$(realpath -m "${PREFIX}")"
-case "${PREFIX}" in
-    /|/usr|/usr/*|/etc|/etc/*|/home|"${HOME}") die "Refusing to install into ${PREFIX}." ;;
-esac
-COMP_DIR="${PREFIX}/${NAME}"
-MANIFEST="${COMP_DIR}/.install-manifest"
+usage() { sed -n '2,/^set -euo/p' "${SELF}" | sed '$d; s/^# \{0,1\}//'; }
 
-# A tree the package manager owns is not ours to replace or remove.
-owned_by_package() {
-    { command -v dpkg >/dev/null 2>&1 && dpkg -S "$1" >/dev/null 2>&1; } ||
-        { command -v rpm >/dev/null 2>&1 && rpm -qf "$1" >/dev/null 2>&1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# --------------------------------------------------------------- checks
+# Which package manager's names to suggest: apt, pacman, dnf or "".
+detect_pm() {
+  local ids=""
+  # shellcheck source=/dev/null
+  [[ -r "${OS_RELEASE}" ]] && ids="$(. "${OS_RELEASE}" && echo " ${ID:-} ${ID_LIKE:-} ")"
+  case "${ids}" in
+  *" debian "* | *" ubuntu "*) echo apt ;;
+  *" arch "*) echo pacman ;;
+  *" fedora "* | *" rhel "*) echo dnf ;;
+  *) echo "" ;;
+  esac
 }
-if [[ -e "${COMP_DIR}" ]] && owned_by_package "${COMP_DIR}"; then
-    die "${COMP_DIR} belongs to the retrobox-labwc package: use your package manager."
-fi
 
-# --- uninstall ----------------------------------------------------------------
-if [[ "${UNINSTALL}" -eq 1 ]]; then
-    [[ -f "${MANIFEST}" ]] || die "No install found in ${COMP_DIR} (missing .install-manifest)."
-    info "Removing ${COMP_DIR}..."
-    while IFS= read -r f; do
-        [[ -n "${f}" ]] && priv rm -f "${f}"
-    done < "${MANIFEST}"
-    priv rm -rf "${COMP_DIR}"
-    if [[ "${CALLED_BY_CORE}" -eq 0 ]]; then
-        priv rm -rf "${PREFIX}/.components/${NAME}"
+# pkg_name PM KEY: the package that provides KEY on that distribution.
+pkg_name() {
+  case "$1:$2" in
+  *:labwc) echo labwc ;;
+  *:terminal) echo foot ;;
+  *:wlr-randr) echo wlr-randr ;;
+  *:wireplumber) echo wireplumber ;;
+  apt:pipewire-pulse | pacman:pipewire-pulse) echo pipewire-pulse ;;
+  dnf:pipewire-pulse) echo pipewire-pulseaudio ;;
+  apt:dbus) echo dbus-bin ;;
+  pacman:dbus) echo dbus ;;
+  dnf:dbus) echo dbus-daemon ;;
+  apt:pactl | dnf:pactl) echo pulseaudio-utils ;;
+  pacman:pactl) echo libpulse ;;
+  apt:xwayland) echo xwayland ;;
+  pacman:xwayland) echo xorg-xwayland ;;
+  dnf:xwayland) echo xorg-x11-server-Xwayland ;;
+  *) echo "$2" ;;
+  esac
+}
+
+# True if systemd's user units include pipewire-pulse (Arch ships the
+# pipewire-pulse command inside the pipewire package, so the command alone
+# proves nothing there).
+pipewire_pulse_unit() {
+  local dir
+  local -a dirs
+  IFS=: read -r -a dirs <<<"${RETROBOX_USER_UNIT_DIRS:-/usr/lib/systemd/user:/lib/systemd/user:/etc/systemd/user}"
+  for dir in "${dirs[@]}"; do
+    [[ -e "${dir}/pipewire-pulse.service" || -e "${dir}/pipewire-pulse.socket" ]] && return 0
+  done
+  return 1
+}
+
+MISSING_REQUIRED=()
+MISSING_OPTIONAL=()
+FAILED=0
+
+# check_required KEY LABEL CMD...: ok if any of the commands exists.
+check_required() {
+  local key="$1" label="$2" cmd
+  shift 2
+  for cmd in "$@"; do
+    if have "${cmd}"; then
+      ok "${label}: $(command -v "${cmd}")"
+      return 0
     fi
-    if [[ "${HAVE_ROOT}" -eq 1 ]]; then
-        # What retrobox-labwc-setup added to /etc for every user: useless now.
-        # shellcheck disable=SC2016  # expanded by that sh, not here
-        priv sh -c 'rm -f /etc/sudoers.d/retrobox-labwc-*
-            for d in /etc/systemd/system/getty@tty*.service.d/retrobox-autologin.conf; do
-                [ -e "$d" ] || continue
-                rm -f "$d"; rmdir "$(dirname "$d")" 2>/dev/null || true
-            done'
-        [[ -d /run/systemd/system ]] && { priv systemctl daemon-reload >/dev/null 2>&1 || true; }
+  done
+  bad "${label} is not installed"
+  MISSING_REQUIRED+=("${key}")
+  FAILED=1
+}
+
+# check_optional KEY LABEL WHAT CMD: warns, never fails.
+check_optional() {
+  if have "$4"; then
+    ok "$2: $(command -v "$4")"
+  else
+    warn "$2 not found (needed for $3)"
+    MISSING_OPTIONAL+=("$1")
+  fi
+}
+
+check_dependencies() {
+  check_required labwc labwc labwc
+  if have pipewire-pulse && { ! have systemctl || pipewire_pulse_unit; }; then
+    ok "pipewire-pulse: $(command -v pipewire-pulse)"
+  else
+    bad "pipewire-pulse is not installed"
+    MISSING_REQUIRED+=(pipewire-pulse)
+    FAILED=1
+  fi
+  check_required terminal "terminal (foot or alacritty)" foot alacritty
+  check_required dbus "dbus-run-session" dbus-run-session
+  check_optional wlr-randr wlr-randr "Win+P, the display switch" wlr-randr
+  check_optional wireplumber wpctl "the volume keys" wpctl
+  check_optional pactl pactl "Win+O, the audio output switch" pactl
+  check_optional xwayland Xwayland "emulators that need X11" Xwayland
+  if find_retrobox_root >/dev/null; then
+    ok "retrobox-core: $(find_retrobox_root)"
+  else
+    warn "retrobox-core not found (no retrobox command): the session cannot start without it"
+  fi
+
+  print_install_hint
+}
+
+print_install_hint() {
+  local pm key cmd
+  local -a pkgs=() rec=()
+  ((${#MISSING_REQUIRED[@]} + ${#MISSING_OPTIONAL[@]} > 0)) || return 0
+  pm="$(detect_pm)"
+  for key in "${MISSING_REQUIRED[@]}"; do pkgs+=("$(pkg_name "${pm}" "${key}")"); done
+  for key in "${MISSING_OPTIONAL[@]}"; do rec+=("$(pkg_name "${pm}" "${key}")"); done
+  case "${pm}" in
+  apt) cmd="sudo apt install" ;;
+  pacman) cmd="sudo pacman -S --needed" ;;
+  dnf) cmd="sudo dnf install" ;;
+  *) cmd="install with your package manager:" ;;
+  esac
+  ((${#pkgs[@]} == 0)) || info "Required: ${cmd} ${pkgs[*]}"
+  ((${#rec[@]} == 0)) || info "Recommended: ${cmd} ${rec[*]}"
+}
+
+# autologin_user TTY: prints the user getty@ttyTTY logs in by itself and
+# returns 0, 1 if it asks for a login, 2 if this cannot be told (no systemd).
+autologin_user() {
+  local unit="getty@tty$1.service" exec_line user
+  have systemctl || return 2
+  # the merged unit, drop-ins included; the last ExecStart= is the one in force
+  exec_line="$(systemctl cat "${unit}" 2>/dev/null | grep -E '^ExecStart=.' | tail -n1)" || return 2
+  user="$(sed -n -E 's/.*[[:space:]](--autologin[=[:space:]]|-a[[:space:]])[[:space:]]*([^[:space:]]+).*/\2/p' <<<"${exec_line}")"
+  [[ -n "${user}" ]] || return 1
+  printf '%s\n' "${user}"
+}
+
+print_autologin_hint() {
+  local tty="$1" agetty
+  agetty="$(PATH="${PATH}:/usr/sbin:/sbin" command -v agetty || true)"
+  agetty="${agetty:-/sbin/agetty}"
+  info "To make tty${tty} log ${USER_NAME} in by itself, run:"
+  cat <<EOF
+  sudo mkdir -p /etc/systemd/system/getty@tty${tty}.service.d
+  sudo tee /etc/systemd/system/getty@tty${tty}.service.d/autologin.conf >/dev/null <<'CONF'
+[Service]
+ExecStart=
+ExecStart=-${agetty} --autologin ${USER_NAME} --noclear %I \$TERM
+CONF
+  sudo systemctl daemon-reload
+EOF
+}
+
+check_autologin() {
+  local tty="$1" user rc=0
+  user="$(autologin_user "${tty}")" || rc=$?
+  case "${rc}" in
+  0)
+    if [[ "${user}" == "${USER_NAME}" ]]; then
+      ok "tty${tty} logs ${USER_NAME} in by itself"
+    else
+      bad "tty${tty} logs '${user}' in by itself, not ${USER_NAME}"
+      FAILED=1
+      print_autologin_hint "${tty}"
     fi
-    ok "Removed. ~/.config/labwc and ~/.bashrc.d/64_retrobox were kept (inert without this; retrobox-labwc-setup -u removes them)."
+    ;;
+  1)
+    bad "tty${tty} has no autologin"
+    FAILED=1
+    print_autologin_hint "${tty}"
+    ;;
+  *)
+    bad "cannot tell if tty${tty} has autologin: this needs a running systemd"
+    FAILED=1
+    ;;
+  esac
+
+  # logind only starts getty on demand for the first NAutoVTs (6) consoles
+  if ((tty > 6)) && have systemctl && ! systemctl is-enabled --quiet "getty@tty${tty}.service" 2>/dev/null; then
+    warn "tty${tty} is above logind's default of 6 on-demand consoles; unless you changed that, run:"
+    warn "  sudo systemctl enable getty@tty${tty}.service"
+  fi
+}
+
+report_keyboard() {
+  detect_keyboard
+  info "Keyboard: ${XKB_LAYOUT}${XKB_VARIANT:+ ${XKB_VARIANT}} (from ${KB_SOURCE})"
+  if [[ "${KB_SOURCE}" == default* ]]; then
+    warn "no system keyboard found: Debian: sudo dpkg-reconfigure keyboard-configuration; others: localectl set-x11-keymap LAYOUT"
+  fi
+}
+
+# --------------------------------------------------------------- install
+# The gaming TTY that was installed, if the script ran before.
+installed_tty() {
+  [[ -f "${MANIFEST}" ]] || return 1
+  sed -n 's/^tty=//p' "${MANIFEST}" | head -n1
+}
+
+# Escapes a string for the replacement side of a sed s||| expression.
+sed_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//|/\\|}"
+  printf '%s' "${value//&/\\&}"
+}
+
+# render TEMPLATE DESTINATION: fills in the @...@ placeholders of this
+# install (and nothing else: rc.xml has wpctl's own @DEFAULT_AUDIO_SINK@).
+render() {
+  sed -e "s|@LABWC_DIR@|$(sed_escape "${DATA_DIR}")|g" \
+    -e "s|@TERMINAL@|$(sed_escape "${TERMINAL}")|g" \
+    -e "s|@SCREENSHOT_CMD@|$(sed_escape "${SCREENSHOT_CMD}")|g" \
+    "$1" >"$2"
+}
+
+# Moves aside a file we are about to replace unless we generated it.
+backup_foreign() {
+  local file="$1" backup
+  if [[ -f "${file}" && ! -L "${file}" ]] && ! grep -qF "${GENERATED_MARK}" "${file}"; then
+    backup="${file}.bak-$(date +%Y%m%d%H%M%S)"
+    mv -- "${file}" "${backup}"
+    warn "Kept your own $(basename -- "${file}") as ${backup}"
+  fi
+}
+
+copy_tree() {
+  local item staging="${DATA_DIR}.new.$$"
+  if [[ "${SELF_DIR}" == "$(realpath -m -- "${DATA_DIR}")" ]]; then
+    return 0 # already running from the installed copy
+  fi
+  info "Copying the session files to ${DATA_DIR}..."
+  rm -rf -- "${staging}"
+  mkdir -p -- "${staging}"
+  for item in "${TREE[@]}"; do cp -a -- "${SELF_DIR}/${item}" "${staging}/"; done
+  # keep the manifest of a previous install (it is rewritten at the end)
+  [[ -f "${MANIFEST}" ]] && cp -a -- "${MANIFEST}" "${staging}/"
+  rm -rf -- "${DATA_DIR}.old.$$"
+  [[ -e "${DATA_DIR}" ]] && mv -- "${DATA_DIR}" "${DATA_DIR}.old.$$"
+  mv -- "${staging}" "${DATA_DIR}"
+  rm -rf -- "${DATA_DIR}.old.$$"
+}
+
+write_labwc_config() {
+  local root name
+  info "Writing the labwc config to ${CONFIG_DIR}..."
+  mkdir -p -- "${CONFIG_DIR}"
+
+  TERMINAL="foot"
+  have foot || TERMINAL="alacritty"
+  if root="$(find_retrobox_root)" && [[ -x "${root}/bin/retrobox-screenshot" ]]; then
+    SCREENSHOT_CMD="${root}/bin/retrobox-screenshot"
+  else
+    SCREENSHOT_CMD="retrobox-screenshot"
+  fi
+
+  for name in rc.xml autostart; do
+    backup_foreign "${CONFIG_DIR}/${name}"
+    rm -f -- "${CONFIG_DIR}/${name}"
+    render "${DATA_DIR}/share/labwc/${name}.in" "${CONFIG_DIR}/${name}"
+  done
+  # no paths in it: linked, so updates apply right away
+  backup_foreign "${CONFIG_DIR}/themerc-override"
+  ln -sfn -- "${DATA_DIR}/share/labwc/themerc-override" "${CONFIG_DIR}/themerc-override"
+}
+
+write_tty_setting() {
+  info "Gaming TTY: ${TTY} (${TTY_DROPIN})"
+  mkdir -p -- "$(dirname -- "${TTY_DROPIN}")"
+  printf '# Written %s.\n[advanced]\nlabwc_tty = %s\n' "${GENERATED_MARK}" "${TTY}" >"${TTY_DROPIN}"
+}
+
+# The profile bash reads for a login shell: the first of PROFILES that
+# exists, or a new ~/.bash_profile.
+login_profile() {
+  local name
+  for name in "${PROFILES[@]}"; do
+    [[ -f "${HOME}/${name}" ]] && {
+      printf '%s\n' "${HOME}/${name}"
+      return 0
+    }
+  done
+  printf '%s\n' "${HOME}/.bash_profile"
+}
+
+# Deletes our block from a profile (if it is there). Written back with cat so
+# a symlinked profile (dotfile managers) stays a symlink.
+remove_block() {
+  local file="$1" tmp
+  [[ -f "${file}" ]] && grep -qF "${BLOCK_BEGIN}" "${file}" || return 0
+  tmp="$(mktemp)"
+  awk -v begin="${BLOCK_BEGIN}" -v end="${BLOCK_END}" '
+    $0 == begin { skip = 1; next }
+    skip && $0 == end { skip = 0; next }
+    !skip { print }
+  ' "${file}" >"${tmp}"
+  cat -- "${tmp}" >"${file}"
+  rm -f -- "${tmp}"
+}
+
+install_login_hook() {
+  local profile name
+  profile="$(login_profile)"
+  info "Adding the session hook to ${profile}..."
+  for name in "${PROFILES[@]}"; do remove_block "${HOME}/${name}"; done
+  if [[ ! -e "${profile}" ]]; then
+    # bash skips ~/.bashrc in a login shell unless the profile reads it
+    printf '%s\n' '[ -r ~/.bashrc ] && . ~/.bashrc' >"${profile}"
+  fi
+  [[ -s "${profile}" && -n "$(tail -c1 "${profile}")" ]] && echo >>"${profile}"
+  {
+    echo "${BLOCK_BEGIN}"
+    echo "[ -n \"\${BASH_VERSION:-}\" ] && [ -r '${DATA_DIR}/share/login-hook.sh' ] && . '${DATA_DIR}/share/login-hook.sh'"
+    echo "${BLOCK_END}"
+  } >>"${profile}"
+  if [[ "$(getent passwd "${USER_NAME}" | cut -d: -f7)" != */bash ]]; then
+    warn "your login shell is not bash: the hook only works from bash (chsh -s /bin/bash)"
+  fi
+}
+
+# What the old packages' retrobox-labwc-setup left in the home directory:
+# its hook would start a second session from the old install.
+remove_legacy() {
+  local hook="${HOME}/.bashrc.d/64_retrobox"
+  if grep -qsF "retrobox-labwc-setup" "${hook}"; then
+    info "Removing the old session hook ${hook}..."
+    rm -f -- "${hook}"
+  fi
+  if grep -qsF "retrobox-labwc-setup" "${HOME}/.config/labwc/rc.xml" 2>/dev/null; then
+    warn "${HOME}/.config/labwc was written by the old retrobox-labwc-setup; it is not used any more (remove it by hand)."
+  fi
+  if [[ -e /usr/local/bin/go2tty || -e /etc/sudoers.d/retrobox-go2tty ]] ||
+    compgen -G '/etc/sudoers.d/retrobox-labwc-*' >/dev/null; then
+    warn "go2tty and its sudoers rules from the old install are still in the system and no longer needed (remove them as root)."
+  fi
+}
+
+do_install() {
+  local prev
+
+  if prev="$(installed_tty)"; then
+    if [[ -n "${TTY_ARG}" ]] && ((10#${TTY_ARG} != 10#${prev})); then
+      die "already installed on tty${prev}: run ./install.sh --uninstall before using tty${TTY_ARG}"
+    fi
+    TTY="$((10#${prev}))"
+    info "Already installed on tty${TTY}: updating."
+  else
+    [[ -n "${TTY_ARG}" ]] || die "which TTY? run it again with --tty N (e.g. --tty 1)"
+    TTY="$((10#${TTY_ARG}))"
+  fi
+
+  info "Checking the system for tty${TTY}..."
+  check_dependencies
+  check_autologin "${TTY}"
+  report_keyboard
+  if ((FAILED == 1)); then
+    ((FORCE == 1)) || die "fix what is marked [MISS] above and run it again (or use --force)"
+    warn "Installing anyway (--force)."
+  fi
+
+  case "${DATA_DIR}${CONFIG_DIR}" in
+  *[[:space:]\&\<\>\'\"\\]*) die "paths with spaces or quotes are not supported (${DATA_DIR}, ${CONFIG_DIR})" ;;
+  *) ;;
+  esac
+
+  copy_tree
+  write_labwc_config
+  write_tty_setting
+  install_login_hook
+  remove_legacy
+
+  mkdir -p -- "${BIN_DIR}"
+  ln -sfn -- "${DATA_DIR}/bin/retrobox-labwc-session" "${SESSION_LINK}"
+  [[ ":${PATH}:" == *":${BIN_DIR}:"* ]] || warn "${BIN_DIR} is not in your PATH (retrobox-labwc-session is linked there)."
+
+  printf 'tty=%s\nuser=%s\ndate=%s\n' "${TTY}" "${USER_NAME}" "$(date -Iseconds)" >"${MANIFEST}"
+  ok "Installed. Log in on tty${TTY} (or reboot) to start the session."
+  info "Remove it with: ${DATA_DIR}/install.sh --uninstall"
+}
+
+# ------------------------------------------------------------- uninstall
+do_uninstall() {
+  local name found=0
+  cd /
+
+  for name in "${PROFILES[@]}"; do
+    if grep -qsF "${BLOCK_BEGIN}" "${HOME}/${name}"; then
+      info "Removing the session hook from ~/${name}..."
+      remove_block "${HOME}/${name}"
+      # a profile that only had our block is gone with it
+      grep -qs '[^[:space:]]' "${HOME}/${name}" || rm -f -- "${HOME}/${name}"
+      found=1
+    fi
+  done
+  if [[ -d "${CONFIG_DIR}" ]]; then
+    info "Removing ${CONFIG_DIR}..."
+    rm -rf -- "${CONFIG_DIR}"
+    found=1
+  fi
+  if grep -qsF "${GENERATED_MARK}" "${TTY_DROPIN}"; then
+    info "Removing ${TTY_DROPIN}..."
+    rm -f -- "${TTY_DROPIN}"
+    rmdir --ignore-fail-on-non-empty -- "$(dirname -- "${TTY_DROPIN}")" 2>/dev/null || true
+    found=1
+  fi
+  if [[ -L "${SESSION_LINK}" && "$(readlink -- "${SESSION_LINK}")" == "${DATA_DIR}/"* ]]; then
+    rm -f -- "${SESSION_LINK}"
+  fi
+  if [[ -d "${DATA_DIR}" ]]; then
+    info "Removing ${DATA_DIR}..."
+    rm -rf -- "${DATA_DIR}"
+    found=1
+  fi
+
+  if ((found == 0)); then
+    info "Nothing to remove."
+  else
+    ok "Removed. Left alone, because it is system-wide: the getty autologin drop-in (/etc/systemd/system/getty@tty*.service.d)."
+  fi
+}
+
+# ------------------------------------------------------------------ main
+TTY_ARG=""
+FORCE=0
+CHECK_ONLY=0
+UNINSTALL=0
+while (($# > 0)); do
+  case "$1" in
+  --tty)
+    TTY_ARG="${2:?--tty needs a VT number}"
+    shift 2
+    ;;
+  --force)
+    FORCE=1
+    shift
+    ;;
+  --check)
+    CHECK_ONLY=1
+    shift
+    ;;
+  --uninstall)
+    UNINSTALL=1
+    shift
+    ;;
+  -h | --help)
+    usage
     exit 0
-fi
-
-# --- fetch --------------------------------------------------------------------
-WORK="$(mktemp -d)"
-trap 'rm -rf "${WORK}"' EXIT
-
-fetch() {  # fetch URL DEST
-    if command -v curl >/dev/null 2>&1; then curl -fsSL --retry 3 -o "$2" "$1"
-    elif command -v wget >/dev/null 2>&1; then wget -q -O "$2" "$1"
-    else die "Neither curl nor wget is installed."; fi
-}
-
-if [[ -n "${TARBALL}" ]]; then
-    [[ -f "${TARBALL}" ]] || die "${TARBALL}: no such file"
-    cp "${TARBALL}" "${WORK}/${ASSET}"
-    [[ -f "$(dirname "${TARBALL}")/SHA256SUMS" ]] && cp "$(dirname "${TARBALL}")/SHA256SUMS" "${WORK}/SHA256SUMS"
-else
-    if [[ -n "${BASE_URL}" ]]; then URL="${BASE_URL%/}"
-    elif [[ -n "${VERSION}" ]]; then URL="https://github.com/${REPO}/releases/download/v${VERSION#v}"
-    else URL="https://github.com/${REPO}/releases/latest/download"; fi
-    info "Downloading ${URL}/${ASSET}..."
-    fetch "${URL}/${ASSET}" "${WORK}/${ASSET}" || die "Download failed."
-    fetch "${URL}/SHA256SUMS" "${WORK}/SHA256SUMS" || die "Could not download SHA256SUMS."
-fi
-if [[ -f "${WORK}/SHA256SUMS" ]]; then
-    (cd "${WORK}" && grep " ${ASSET}\$" SHA256SUMS | sha256sum -c --quiet -) \
-        || die "Checksum mismatch for ${ASSET}."
-    ok "Checksum verified."
-else
-    warn "No SHA256SUMS next to the tarball: not verifying it."
-fi
-
-mkdir "${WORK}/x"
-tar -xzf "${WORK}/${ASSET}" -C "${WORK}/x" --strip-components=1
-[[ -x "${WORK}/x/labwc/bin/retrobox-labwc-session" ]] || die "The tarball doesn't look like a retrobox-labwc release."
-NEW_VERSION="$(head -n1 "${WORK}/x/labwc/VERSION" 2>/dev/null || echo unknown)"
-info "Installing ${NEW_VERSION} into ${COMP_DIR}..."
-[[ -x "${PREFIX}/bin/retrobox" ]] \
-    || warn "retrobox-core is not in ${PREFIX}: the session will look for \`retrobox\` on PATH."
-
-# --- dependencies ---------------------------------------------------------------
-install_deps() {
-    local tree="${WORK}/x/extras" pkgs rec
-    if [[ -e /run/ostree-booted || "${HAVE_ROOT}" -eq 0 ]]; then
-        warn "Install these with your package manager (layer them on an immutable system):"
-        warn "  $(sed -e 's/#.*//' "${tree}/deps/fedora.list" | tr '\n' ' ' | tr -s ' ')"
-        return
-    fi
-    # shellcheck source=/dev/null
-    source "${tree}/deps.sh"
-    if command -v apt-get >/dev/null 2>&1; then
-        priv apt-get update -qq
-        mapfile -t pkgs < <(deps_apt_args "${tree}/deps/debian.list")
-        priv env DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"
-        mapfile -t rec < <(deps_apt_args "${tree}/deps/recommended-debian.list")
-        priv env DEBIAN_FRONTEND=noninteractive apt-get install -y "${rec[@]}" \
-            || warn "Some recommended packages could not be installed."
-    elif command -v dnf >/dev/null 2>&1; then
-        mapfile -t pkgs < <(deps_list "${tree}/deps/fedora.list")
-        priv dnf install -y "${pkgs[@]}"
-        mapfile -t rec < <(deps_list "${tree}/deps/recommended-fedora.list")
-        priv dnf install -y --setopt=strict=0 "${rec[@]}" || warn "Some recommended packages could not be installed."
-    else
-        warn "No apt or dnf: install labwc, wlr-randr, wireplumber (wpctl), pactl, chvt, pgrep, dbus-run-session and sudo yourself."
-    fi
-}
-[[ "${DO_DEPS}" -eq 1 ]] && install_deps
-
-# --- install the tree (swap in, keep the old one until the new one is in place) --
-OLD_MANIFEST="${WORK}/old-manifest"
-: > "${OLD_MANIFEST}"
-[[ -f "${MANIFEST}" ]] && cp "${MANIFEST}" "${OLD_MANIFEST}"
-
-priv mkdir -p "${PREFIX}"
-STAGING="${COMP_DIR}.new.$$"
-priv rm -rf "${STAGING}"
-priv cp -a "${WORK}/x/labwc" "${STAGING}"
-if [[ "${HAVE_ROOT}" -eq 1 ]]; then priv chown -R root:root "${STAGING}"; fi
-# Readable by every user, writable by nobody else: go2tty is run through sudo.
-priv chmod -R a+rX,go-w "${STAGING}"
-if [[ -e "${COMP_DIR}" ]]; then
-    priv rm -rf "${COMP_DIR}.old.$$"
-    priv mv "${COMP_DIR}" "${COMP_DIR}.old.$$"
-fi
-priv mv "${STAGING}" "${COMP_DIR}"
-priv rm -rf "${COMP_DIR}.old.$$"
-
-# --- commands -------------------------------------------------------------------
-: > "${WORK}/manifest"
-priv mkdir -p "${BIN_DIR}"
-for cmd in "${COMP_DIR}"/bin/*; do
-    link="${BIN_DIR}/$(basename "${cmd}")"
-    priv ln -sfn "${cmd}" "${link}"
-    echo "${link}" >> "${WORK}/manifest"
+    ;;
+  *) die "unknown option: $1 (see --help)" ;;
+  esac
 done
-# Commands of the previous version that are gone now.
-while IFS= read -r f; do
-    [[ -n "${f}" ]] && ! grep -qxF "${f}" "${WORK}/manifest" && priv rm -f "${f}"
-done < "${OLD_MANIFEST}"
-priv install -m 644 "${WORK}/manifest" "${MANIFEST}"
 
-# --- register with a script-installed retrobox-core --------------------------------
-# So that its updates bring this back and its --uninstall removes it. (When
-# retrobox-core runs this script, it does that itself.)
-if [[ "${CALLED_BY_CORE}" -eq 0 && -f "${PREFIX}/.install-manifest" ]]; then
-    self="${WORK}/self.sh"
-    if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
-        cp "${BASH_SOURCE[0]}" "${self}"
-    else  # piped into bash: fetch a copy of this script
-        fetch "https://raw.githubusercontent.com/${REPO}/HEAD/install.sh" "${self}" || self=""
-    fi
-    if [[ -n "${self}" ]]; then
-        priv mkdir -p "${PREFIX}/.components/${NAME}"
-        priv install -m 755 "${self}" "${PREFIX}/.components/${NAME}/install.sh"
-        printf '\n' > "${WORK}/source"
-        priv install -m 644 "${WORK}/source" "${PREFIX}/.components/${NAME}/source"
-        info "Registered as a component of retrobox-core in ${PREFIX}."
-    fi
+USER_NAME="$(id -un)"
+readonly USER_NAME
+((EUID != 0)) || die "run it as the user who plays, not as root: it needs no privileges"
+[[ -z "${TTY_ARG}" ]] || is_valid_tty "${TTY_ARG}" || die "--tty needs a VT number between 1 and 12"
+
+if ((UNINSTALL == 1)); then
+  do_uninstall
+  exit 0
 fi
 
-ok "${NEW_VERSION} installed in ${COMP_DIR}."
-[[ ":${PATH}:" == *":${BIN_DIR}:"* ]] || warn "${BIN_DIR} is not in your PATH."
-
-# --- per-user setup ---------------------------------------------------------------
-SETUP_CMD="${COMP_DIR}/bin/retrobox-labwc-setup"
-if [[ "${SETUP}" -eq 1 ]]; then
-    if [[ "${EUID}" -ne 0 ]]; then
-        "${SETUP_CMD}" "${SETUP_ARGS[@]}"
-    elif [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
-        sudo -u "${SUDO_USER}" -H -- "${SETUP_CMD}" "${SETUP_ARGS[@]}"
-    else
-        warn "--setup: run as root without sudo, so there is no user to set up."
-        warn "Each user who plays runs: retrobox-labwc-setup --tty N --autologin"
-    fi
-else
-    info "Each user who plays runs once: retrobox-labwc-setup --tty N --autologin"
+if ((CHECK_ONLY == 1)); then
+  TTY="$(installed_tty || true)"
+  if [[ -n "${TTY_ARG}" ]]; then TTY="$((10#${TTY_ARG}))"; fi
+  [[ -n "${TTY}" ]] || die "which TTY? use --check --tty N"
+  check_dependencies
+  check_autologin "${TTY}"
+  report_keyboard
+  exit "${FAILED}"
 fi
+
+do_install

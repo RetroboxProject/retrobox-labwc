@@ -1,4 +1,0 @@
-# Generated from environment.in by retrobox-labwc-setup - do not edit (re-run it instead).
-# Keyboard layout of the gaming session (taken from the system's settings).
-XKB_DEFAULT_LAYOUT=@XKB_LAYOUT@
-XKB_DEFAULT_VARIANT=@XKB_VARIANT@

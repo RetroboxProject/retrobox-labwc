@@ -1,63 +1,73 @@
 # retrobox-labwc
 
-The labwc gaming session of [Retrobox](https://github.com/RetroboxProject/retrobox-core): Retrobox runs inside a [labwc](https://labwc.github.io) Wayland session on a virtual terminal of its own, isolated from the desktop session (separate D-Bus session), so a game never fights with Plasma (or whatever desktop you use) for the screen.
+The labwc gaming session of [Retrobox](https://github.com/RetroboxProject/retrobox-core), for **minimal systems** (Debian netinstall, Arch, ...): the machine logs in on a TTY by itself, starts [labwc](https://labwc.github.io) there and Retrobox runs inside it. No desktop, no display manager.
 
-- `retrobox-enter-tty` (from the desktop) switches to the gaming TTY; its autologin shell starts labwc and Retrobox side by side.
-- **Win+D** goes back to the desktop and leaves the session running; quitting Retrobox closes labwc and returns to the desktop by itself.
-- **Win+P** switches the display output (internal panel ⇄ external screen) and **Win+O** the audio output; the volume keys, **Print** (Retrobox screenshot), **Alt+Tab**, **Alt+F4** and **Win+T** (terminal) work as usual.
+It is a single user-level installer: no root, no packages. It checks what the system must already have and sets up the rest inside your home.
 
-It is a component of `retrobox-core` and needs it installed.
+- **Win+P** switches the display output (internal panel ⇄ external screen) and **Win+O** the audio output.
+- **Win+Shift+R** restarts the session (it re-reads the system keyboard), **Win+Shift+E** exits labwc and ends it.
+- The volume keys, **Print** (Retrobox screenshot), **Alt+Tab**, **Alt+F4** and **Win+T** (terminal) work as usual.
+
+Retrobox ending closes labwc, and you are left at the shell prompt of that TTY (log out for a fresh autologin).
+
+## Requirements
+
+Installed by you, with your package manager (`./install.sh --check --tty N` tells you which):
+
+| | Debian | Arch |
+|---|---|---|
+| labwc | `labwc` | `labwc` |
+| pipewire-pulse | `pipewire-pulse` | `pipewire-pulse` |
+| a terminal | `foot` (or `alacritty`) | `foot` |
+| dbus-run-session | `dbus-bin` | `dbus` |
+| recommended | `wlr-randr wireplumber pulseaudio-utils xwayland` | `wlr-randr wireplumber libpulse xorg-xwayland` |
+
+plus `retrobox-core`, and systemd with a `getty` autologin on the gaming TTY. The installer **checks** the autologin and, if it is missing, prints the drop-in to create (that part is system-wide, so it is yours to do):
+
+```bash
+sudo mkdir -p /etc/systemd/system/getty@tty1.service.d
+sudo tee /etc/systemd/system/getty@tty1.service.d/autologin.conf >/dev/null <<'CONF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin YOUR_USER --noclear %I $TERM
+CONF
+sudo systemctl daemon-reload
+```
 
 ## Install
 
-**Debian / Ubuntu (.deb)** and **Fedora (.rpm)**, from the [releases](https://github.com/RetroboxProject/retrobox-labwc/releases) (one package for every architecture):
-
 ```bash
-sudo apt install ./retrobox-labwc_<version>_all.deb
-sudo dnf install ./retrobox-labwc-<version>-1.noarch.rpm
+git clone https://github.com/RetroboxProject/retrobox-labwc && cd retrobox-labwc
+./install.sh --tty 1        # --check --tty 1 only checks; --force installs even if a check fails
 ```
 
-**install.sh**, together with a script-installed `retrobox-core` (it is then updated with the core and removed with it):
+Everything lands in your home:
+
+- `~/.local/share/retrobox-labwc`: a copy of this tree (the checkout can go) and `retrobox-labwc-session` linked in `~/.local/bin`
+- `~/.config/retrobox-labwc`: labwc's config for the session (`labwc -C`); your `~/.config/labwc` is never touched
+- `~/.config/retrobox/retrobox.ini.d/50-labwc.ini`: `[advanced] labwc_tty`
+- a block in your login profile (`~/.bash_profile`, `~/.bash_login` or `~/.profile`, whichever bash reads) that starts the session when the gaming TTY logs in
+
+**The TTY is fixed once installed.** To change it: `~/.local/share/retrobox-labwc/install.sh --uninstall`, then install again. Running the installer again with the same TTY just updates.
+
+`--uninstall` removes all of the above (and restores your profile). It leaves the getty autologin alone, since it lives in `/etc`.
+
+## Keyboard
+
+The session always uses the system's keyboard: `/etc/default/keyboard` (Debian's `keyboard-configuration`), else `localectl`'s X11 keymap, read every time the session starts. Nothing is copied into labwc's config. To change it on Debian:
 
 ```bash
-curl -fsSL https://github.com/RetroboxProject/retrobox-core/releases/latest/download/install.sh | bash -s -- --with labwc
+sudo dpkg-reconfigure keyboard-configuration
 ```
 
-or on its own, next to an existing `retrobox-core`, setting up the current user at the same time:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/RetroboxProject/retrobox-labwc/HEAD/install.sh | bash -s -- --setup -- --tty 8 --autologin
-# options: --prefix DIR  --bin-dir DIR  --user  --version X.Y.Z  --tarball FILE  --no-deps  --setup [-- ARGS]  --uninstall
-```
-
-Everything lands in `<retrobox-core prefix>/labwc` (`/opt/retrobox/labwc`), with the commands in `/usr/bin` (packages) or `/usr/local/bin` (install.sh).
-
-### Per-user setup
-
-The package only puts files on the system. Each user who plays runs, once (and again after an upgrade):
-
-```bash
-retrobox-labwc-setup --tty 8 --autologin
-```
-
-- `--tty N` picks the gaming VT: it writes `[advanced] labwc_tty = N` to `~/.config/retrobox/retrobox.ini.d/50-labwc.ini` (any `retrobox.ini` layer works, as in retrobox-core).
-- renders `rc.xml`, `autostart` and `environment` (with this install's paths and the system keyboard layout) into `~/.config/labwc` and links `themerc-override`; files of yours it would replace are kept as `*.bak-<date>`.
-- installs `~/.bashrc.d/64_retrobox`, the hook that starts the session from the gaming TTY's autologin shell. Debian's default `~/.bashrc` doesn't read `~/.bashrc.d`; the script tells you the line to add.
-- through `sudo`: lets you run `go2tty` (the VT switcher, which needs root) without a password, with a rule for exactly that file, and with `--autologin` makes the gaming TTY log you in (a drop-in for `getty@ttyN.service`).
-- `--no-system` does only the per-user part; `-u` undoes everything.
-
-The passwordless rule is only written when `go2tty` and every directory above it belong to root and nobody else can write to them (packages and a root `install.sh`): with `--user` or from a git checkout, switching TTYs asks for your password instead.
+then press **Win+Shift+R** (or log out and in again).
 
 ## Configuration
 
-In any `retrobox.ini` layer (`/etc/retrobox`, `~/.config/retrobox`, their `retrobox.ini.d/`):
+In any `retrobox.ini` layer (`/etc/retrobox`, `~/.config/retrobox`, their `retrobox.ini.d/`), only when the guess is wrong (outputs from `wlr-randr`, sinks from `pactl list short sinks`):
 
 ```ini
-[advanced]
-labwc_tty = 8                   ; the gaming VT (1-12)
-
 [labwc]
-; only when the guess is wrong (outputs from `wlr-randr`, sinks from `pactl list short sinks`)
 internal_output = eDP-1         ; default: the first eDP/LVDS/DSI output
 external_output = HDMI-A-1      ; default: the first other output
 external_sink = alsa_output.pci-0000_01_00.1.hdmi-stereo   ; default: the first hdmi/displayport sink
@@ -69,23 +79,12 @@ The session log is `~/.local/state/retrobox/logs/labwc-session.log`.
 ## Layout
 
 ```
-bin/          commands: retrobox-enter-tty, retrobox-exit-tty, retrobox-labwc-session, retrobox-labwc-setup
-libexec/      go2tty (run as root through sudo), display/audio switchers, retrobox-labwc-common.sh
-share/        labwc config templates, the ~/.bashrc.d hook template
-deps/         dependency lists (Debian, Fedora): the packages' Depends and install.sh's single source
-packaging/    stage.sh, deb/, rpm/, tarball/, smoke-test.sh
-install.sh    standalone / retrobox-core component installer
+install.sh    the installer: --check, install, --uninstall
+bin/          retrobox-labwc-session
+libexec/      display/audio switchers, retrobox-labwc-common.sh (settings, keyboard)
+share/        labwc config templates, the login hook
+tests/        smoke-test.sh (stand-in commands, throwaway HOME)
 ```
-
-## Building
-
-```bash
-packaging/deb/build-deb.sh           # dist/retrobox-labwc_<version>_all.deb
-packaging/rpm/build-rpm.sh           # dist/retrobox-labwc-<version>-1.noarch.rpm (needs rpmbuild)
-packaging/tarball/build-tarball.sh   # dist/retrobox-labwc-all.tar.gz + SHA256SUMS (the install.sh payload)
-```
-
-Versions come from the tags (`vX.Y.Z` → `X.Y.Z`, otherwise `<last tag>+git<date>.<sha>`). The GitHub Actions workflow lints the scripts with shellcheck, builds the three, tests the packages in Ubuntu 24.04, Debian 13 and Fedora containers (against a stand-in `retrobox-core`) and `install.sh` next to a script-installed core and, for `v*` tags, publishes them with `install.sh` and `SHA256SUMS` as a release.
 
 ## License
 

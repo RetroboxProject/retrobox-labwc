@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Runs the labwc gaming session on the gaming TTY and, once retrobox
-# ends, closes labwc for good and returns to the original TTY.
+# Runs the labwc gaming session on the gaming TTY: labwc and retrobox side
+# by side, closed together when either of them ends.
 #
-# This script is exec'd by ~/.bashrc.d/64_retrobox from the autologin
-# shell of the TTY configured in retrobox.ini ([advanced] labwc_tty), so
-# it runs in the foreground, attached to that VT — that is what gives
-# labwc a seat.
+# It is started by the login hook (see `retrobox-labwc install`) from the
+# autologin shell of the TTY configured in retrobox.ini ([advanced]
+# labwc_tty), so it runs in the foreground, attached to that VT — that is
+# what gives labwc a seat. When the session ends you are left at the shell
+# prompt of that TTY (log out for a fresh autologin).
 #
 # labwc's "-s" is deliberately not used: labwc only ties its lifetime to
 # the startup command when that command is itself the primary Wayland
@@ -14,10 +15,15 @@
 # retrobox are started side by side inside one D-Bus session and
 # whichever ends first takes the other down with it.
 #
+# The keyboard layout is the system's (/etc/default/keyboard, ...) and is
+# read again on every start, including a restart.
+#
 # Usage: retrobox-labwc-session [-f]
-#   -f        Skip the "am I on the gaming TTY?" check.
-#   --inner   Internal: the part that runs inside dbus-run-session.
-set -uo pipefail # no "-e": the TTY handoff below must always run
+#   -f          Skip the "am I on the gaming TTY?" check.
+#   --restart   Restart the running session (Win+Shift+R): it starts over
+#               with the system keyboard as it is now.
+#   --inner     Internal: the part that runs inside dbus-run-session.
+set -uo pipefail # no "-e": the cleanup below must always run
 
 SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 readonly SELF
@@ -34,9 +40,13 @@ mkdir -p -- "$(dirname -- "${LOG_FILE}")" 2>/dev/null || true
 readonly TERM_GRACE_SECS=5
 # How long to wait for labwc to report its environment (see autostart.in).
 readonly ENV_WAIT_SECS=15
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+readonly RUNTIME_DIR
 # labwc's autostart writes the environment labwc sets up for its own
 # children (DISPLAY, WAYLAND_DISPLAY, XDG_SESSION_TYPE, ...) here.
-readonly ENV_FILE="${RETROBOX_LABWC_ENV_FILE:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/retrobox-labwc.env}"
+readonly ENV_FILE="${RETROBOX_LABWC_ENV_FILE:-${RUNTIME_DIR}/retrobox-labwc.env}"
+# Its presence when labwc ends means "start over" instead of "stop".
+readonly RESTART_FLAG="${RUNTIME_DIR}/retrobox-labwc.restart"
 
 log() {
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"${LOG_FILE}"
@@ -94,12 +104,16 @@ import_labwc_env() {
 # ---------------------------------------------------------------------
 run_session() {
   local labwc_pid app_pid app_status=0 i
+  local -a labwc_cmd=(labwc)
+
+  # The session's own config, not ~/.config/labwc.
+  [[ -d "${RETROBOX_LABWC_CONFIG_DIR}" ]] && labwc_cmd+=(-C "${RETROBOX_LABWC_CONFIG_DIR}")
 
   # A stale file from a previous session would look like "labwc is ready".
   rm -f "${ENV_FILE}"
 
-  log "starting labwc"
-  labwc &
+  log "starting ${labwc_cmd[*]}"
+  "${labwc_cmd[@]}" &
   labwc_pid=$!
 
   # labwc's autostart writes ENV_FILE once the compositor is up, so its
@@ -115,7 +129,7 @@ run_session() {
   done
 
   if [[ ! -s "${ENV_FILE}" ]]; then
-    log "timed out waiting for ${ENV_FILE}; is ~/.config/labwc/autostart up to date? (run retrobox-labwc-setup)"
+    log "timed out waiting for ${ENV_FILE}; is ${RETROBOX_LABWC_CONFIG_DIR}/autostart up to date? (run retrobox-labwc install)"
     stop_pid "${labwc_pid}" "labwc"
     return 1
   fi
@@ -147,8 +161,12 @@ run_session() {
   return "${app_status}"
 }
 
-# retrobox-core's launcher (an explicit RETROBOX_ROOT, or the install this
-# component sits in, or `retrobox` on PATH).
+# This user's labwc processes only: other users may have theirs.
+labwc_running() {
+  pgrep -u "$(id -u)" -x labwc >/dev/null 2>&1
+}
+
+# retrobox-core's launcher (an explicit RETROBOX_ROOT, or `retrobox` on PATH).
 if root="$(find_retrobox_root)"; then
   RETROBOX_BIN="${root}/bin/retrobox"
 else
@@ -161,16 +179,40 @@ if (($# == 1)) && [[ "$1" == "--inner" ]]; then
   exit $?
 fi
 
+if (($# == 1)) && [[ "$1" == "--restart" ]]; then
+  if ! labwc_running; then
+    echo "error: no labwc session is running" >&2
+    exit 1
+  fi
+  touch -- "${RESTART_FLAG}"
+  # labwc ending is what ends the session; the flag turns that into a restart.
+  pkill -TERM -u "$(id -u)" -x labwc
+  exit 0
+fi
+
 force=0
 if (($# == 1)) && [[ "$1" == "-f" ]]; then
   force=1
 elif (($# > 0)); then
-  echo "usage: $(basename "${BASH_SOURCE[0]}") [-f]" >&2
+  echo "usage: $(basename "${BASH_SOURCE[0]}") [-f | --restart]" >&2
   exit 1
 fi
 
 if [[ -z "${RETROBOX_BIN}" ]]; then
   echo "error: retrobox-core not found (no retrobox command); install it first" >&2
+  exit 1
+fi
+
+for cmd in labwc dbus-run-session; do
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    echo "error: ${cmd} not found (see: retrobox-labwc check)" >&2
+    exit 1
+  fi
+done
+
+if [[ -z "${XDG_RUNTIME_DIR:-}" || ! -d "${XDG_RUNTIME_DIR}" ]]; then
+  echo "error: no XDG_RUNTIME_DIR: labwc needs a logind session" \
+    "(on Debian: install libpam-systemd and log in again)" >&2
   exit 1
 fi
 
@@ -181,50 +223,31 @@ if ((force == 0)); then
   current_tty="$(get_current_tty || true)"
   if [[ "${current_tty}" != "${GAMING_TTY}" ]]; then
     echo "error: the session must be started from tty${GAMING_TTY}" \
-      "(currently on ${current_tty:-a non-VT terminal}); use" \
-      "retrobox-enter-tty, or -f to override" >&2
+      "(currently on ${current_tty:-a non-VT terminal}); use -f to override" >&2
     exit 1
   fi
 fi
 
-if pgrep -x labwc >/dev/null 2>&1; then
+if labwc_running; then
   echo "error: labwc is already running" >&2
   exit 1
 fi
 
-# Keep the session's D-Bus activation environment out of the Plasma one.
-export LABWC_UPDATE_ACTIVATION_ENV=off
 # Tell labwc's autostart where to report its environment.
 export RETROBOX_LABWC_ENV_FILE="${ENV_FILE}"
-
-# Backstop: whatever ends this script — retrobox finishing, labwc
-# being closed by hand, this being signalled — no labwc is left behind
-# and the VT goes back to whoever called retrobox-enter-tty. Runs once.
-handoff_done=0
-finish() {
-  ((handoff_done == 1)) && return 0
-  handoff_done=1
-
-  kill_labwc
-
-  log "returning to the original TTY"
-  # No -n: stops this TTY's getty too, so the autologin shell isn't
-  # respawned into another session right after this one ended.
-  "${SCRIPT_DIR}/retrobox-exit-tty" >>"${LOG_FILE}" 2>&1
-}
 
 # Terminates any labwc left behind and waits for it to actually die,
 # escalating to SIGKILL. Covers the case where the inner half was killed
 # before it could clean up.
 kill_labwc() {
   local i
-  pgrep -x labwc >/dev/null 2>&1 || return 0
+  labwc_running || return 0
 
   log "labwc still running; asking it to exit"
-  pkill -x labwc 2>/dev/null
+  pkill -u "$(id -u)" -x labwc 2>/dev/null
 
   for ((i = 0; i < TERM_GRACE_SECS * 4; i++)); do
-    pgrep -x labwc >/dev/null 2>&1 || {
+    labwc_running || {
       log "labwc closed"
       return 0
     }
@@ -232,20 +255,33 @@ kill_labwc() {
   done
 
   log "labwc didn't exit; killing it"
-  pkill -KILL -x labwc 2>/dev/null
+  pkill -KILL -u "$(id -u)" -x labwc 2>/dev/null
   for ((i = 0; i < 8; i++)); do
-    pgrep -x labwc >/dev/null 2>&1 || break
+    labwc_running || break
     sleep 0.25
   done
 }
 
-trap finish EXIT
+# Backstop: whatever ends this script — retrobox finishing, labwc being
+# closed by hand, this being signalled — no labwc is left behind.
+trap kill_labwc EXIT
 trap 'exit 143' TERM INT HUP
 
-log "Starting labwc gaming session on tty${GAMING_TTY} (${RETROBOX_BIN})"
-dbus-run-session -- "${SELF}" --inner >>"${LOG_FILE}" 2>&1
-exit_status=$?
-log "session ended with status ${exit_status}"
+exit_status=0
+rm -f -- "${RESTART_FLAG}"
+while :; do
+  # The system keyboard, as it is right now (a restart picks up changes).
+  export_keyboard_env
+  log "Starting labwc gaming session on tty${GAMING_TTY} (${RETROBOX_BIN}; keyboard ${XKB_LAYOUT}${XKB_VARIANT:+ ${XKB_VARIANT}} from ${KB_SOURCE})"
 
-finish
+  dbus-run-session -- "${SELF}" --inner >>"${LOG_FILE}" 2>&1
+  exit_status=$?
+  log "session ended with status ${exit_status}"
+
+  [[ -e "${RESTART_FLAG}" ]] || break
+  rm -f -- "${RESTART_FLAG}"
+  log "restarting the session"
+  kill_labwc
+done
+
 exit "${exit_status}"

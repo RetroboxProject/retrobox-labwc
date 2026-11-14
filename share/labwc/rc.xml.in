@@ -1,7 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Generated from rc.xml.in by retrobox-labwc-setup - do not edit (re-run it instead). -->
+<!-- Generated from rc.xml.in by retrobox-labwc - do not edit (re-run `retrobox-labwc install` instead). -->
+<!-- The keyboard layout is not set here: the session exports the system's (XKB_DEFAULT_*). -->
 <labwc_config>
   <keyboard>
+    <!-- labwc's default keybinds first, so the ones below can override them -->
+    <default/>
     <!-- Switch display output and audio sink -->
     <keybind key="W-p">
       <action name="Execute">
@@ -13,10 +16,10 @@
         <command>@LABWC_DIR@/libexec/retrobox-switch-audio-out toggle</command>
       </action>
     </keybind>
-    <!-- Switch back to the desktop session -->
-    <keybind key="W-d">
+    <!-- Restart the session (re-reads the system keyboard) -->
+    <keybind key="W-S-r">
       <action name="Execute">
-        <command>@LABWC_DIR@/bin/retrobox-exit-tty -n</command>
+        <command>@LABWC_DIR@/bin/retrobox-labwc-session --restart</command>
       </action>
     </keybind>
     <!-- Close the active window -->
@@ -52,13 +55,13 @@
         <command>wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle</command>
       </action>
     </keybind>
-    <!-- Optional terminal -->
+    <!-- Terminal -->
     <keybind key="W-t">
       <action name="Execute">
-        <command>alacritty</command>
+        <command>@TERMINAL@</command>
       </action>
     </keybind>
-    <!-- Exit labwc manually -->
+    <!-- Exit labwc (ends the session) -->
     <keybind key="W-S-e">
       <action name="Exit"/>
     </keybind>
@@ -68,10 +71,7 @@
         <command>@SCREENSHOT_CMD@</command>
       </action>
     </keybind>
-    <layoutFiles enabled="no"/>
-    <default/>
     <repeatRate>25</repeatRate>
     <repeatDelay>600</repeatDelay>
-    <layout>@XKB_LAYOUT@</layout>
   </keyboard>
 </labwc_config>
