@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Picks the display output of the gaming session (run by labwc's autostart
-# and by the Win+P keybind), and moves the audio along with it.
+# and by the Win+P keybind).
 #
 #   * no external screen connected  -> internal panel only
 #   * only the external one is on   -> back to the internal panel
@@ -102,15 +102,11 @@ is_enabled() {
 use_internal() {
   if connected "${external}"; then wlr-randr --output "${external}" --off; fi
   turn_on "${internal}"
-  "${SCRIPT_DIR}/retrobox-switch-audio-out" internal || true
 }
 
 use_external() {
   if connected "${internal}"; then wlr-randr --output "${internal}" --off; fi
   turn_on "${external}"
-  # give the screen time to bring its audio device up
-  sleep 3
-  "${SCRIPT_DIR}/retrobox-switch-audio-out" external || true
 }
 
 if [[ "${1:-}" == "mode" ]]; then

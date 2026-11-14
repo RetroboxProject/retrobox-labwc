@@ -5,15 +5,10 @@
   <keyboard>
     <!-- labwc's default keybinds first, so the ones below can override them -->
     <default/>
-    <!-- Switch display output and audio sink -->
+    <!-- Switch display output -->
     <keybind key="W-p">
       <action name="Execute">
         <command>@LABWC_DIR@/libexec/retrobox-switch-display toggle</command>
-      </action>
-    </keybind>
-    <keybind key="W-o">
-      <action name="Execute">
-        <command>@LABWC_DIR@/libexec/retrobox-switch-audio-out toggle</command>
       </action>
     </keybind>
     <!-- Restart the session (re-reads the system keyboard) -->
@@ -33,10 +28,10 @@
     <keybind key="A-S-Tab">
       <action name="PreviousWindow"/>
     </keybind>
-    <!-- PipeWire volume: default sink -->
+    <!-- PipeWire volume: default sink, never above 100% (-l 1.0) -->
     <keybind key="XF86AudioRaiseVolume">
       <action name="Execute">
-        <command>wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+</command>
+        <command>wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+</command>
       </action>
     </keybind>
     <keybind key="XF86AudioLowerVolume">

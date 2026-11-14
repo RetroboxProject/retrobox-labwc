@@ -106,8 +106,6 @@ pkg_name() {
   apt:dbus) echo dbus-bin ;;
   pacman:dbus) echo dbus ;;
   dnf:dbus) echo dbus-daemon ;;
-  apt:pactl | dnf:pactl) echo pulseaudio-utils ;;
-  pacman:pactl) echo libpulse ;;
   apt:xwayland) echo xwayland ;;
   pacman:xwayland) echo xorg-xwayland ;;
   dnf:xwayland) echo xorg-x11-server-Xwayland ;;
@@ -172,7 +170,6 @@ check_dependencies() {
   ((tty == 1)) || check_required kbd "chvt (to boot on tty${tty})" chvt
   check_optional wlr-randr wlr-randr "Win+P, the display switch" wlr-randr
   check_optional wireplumber wpctl "the volume keys" wpctl
-  check_optional pactl pactl "Win+O, the audio output switch" pactl
   check_optional xwayland Xwayland "emulators that need X11" Xwayland
   if find_retrobox_root >/dev/null; then
     ok "retrobox-core: $(find_retrobox_root)"

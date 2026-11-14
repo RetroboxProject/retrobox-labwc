@@ -29,7 +29,7 @@ printf 'XKBMODEL="pc105"\nXKBLAYOUT="es"\nXKBVARIANT=""\nXKBOPTIONS="grp:alt_shi
 # --- stand-in commands -------------------------------------------------------------
 STUBS="${WORK}/stubs"
 mkdir -p "${STUBS}"
-for cmd in labwc pipewire-pulse foot dbus-run-session wlr-randr wpctl pactl Xwayland chvt retrobox; do
+for cmd in labwc pipewire-pulse foot dbus-run-session wlr-randr wpctl Xwayland chvt retrobox; do
   printf '#!/bin/sh\nexit 0\n' >"${STUBS}/${cmd}"
 done
 mkdir -p "${WORK}/core/bin"

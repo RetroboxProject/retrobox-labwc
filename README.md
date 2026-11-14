@@ -4,9 +4,9 @@ The labwc gaming session of [Retrobox](https://github.com/RetroboxProject/retrob
 
 It is a single user-level installer: no root, no packages. It checks what the system must already have and sets up the rest inside your home.
 
-- **Win+P** switches the display output (internal panel ⇄ external screen) and **Win+O** the audio output.
+- **Win+P** switches the display output (internal panel ⇄ external screen).
 - **Win+Shift+R** restarts the session (it re-reads the system keyboard), **Win+Shift+E** exits labwc and ends it.
-- The volume keys, **Print** (Retrobox screenshot), **Alt+Tab**, **Alt+F4** and **Win+T** (terminal) work as usual.
+- The volume keys (capped at 100%, no distorted boost), **Print** (Retrobox screenshot), **Alt+Tab**, **Alt+F4** and **Win+T** (terminal) work as usual.
 
 Retrobox ending closes labwc, and you are left at the shell prompt of that TTY (log out for a fresh autologin).
 
@@ -20,7 +20,7 @@ Installed by you, with your package manager (`./install.sh --check --tty N` tell
 | pipewire-pulse | `pipewire-pulse` | `pipewire-pulse` |
 | a terminal | `foot` (or `alacritty`) | `foot` |
 | dbus-run-session | `dbus-bin` | `dbus` |
-| recommended | `wlr-randr wireplumber pulseaudio-utils xwayland` | `wlr-randr wireplumber libpulse xorg-xwayland` |
+| recommended | `wlr-randr wireplumber xwayland` | `wlr-randr wireplumber xorg-xwayland` |
 
 plus `retrobox-core` and systemd. For any TTY but 1, `chvt` (package `kbd`) is needed too.
 
@@ -60,14 +60,12 @@ The session runs at whatever the kernel command line forces, and at nothing else
 
 ## Configuration
 
-In any `retrobox.ini` layer (`/etc/retrobox`, `~/.config/retrobox`, their `retrobox.ini.d/`), only when the guess is wrong (outputs from `wlr-randr`, sinks from `pactl list short sinks`):
+In any `retrobox.ini` layer (`/etc/retrobox`, `~/.config/retrobox`, their `retrobox.ini.d/`), only when the guess is wrong (outputs from `wlr-randr`):
 
 ```ini
 [labwc]
 internal_output = eDP-1         ; default: the first eDP/LVDS/DSI output
 external_output = HDMI-A-1      ; default: the first other output
-external_sink = alsa_output.pci-0000_01_00.1.hdmi-stereo   ; default: the first hdmi/displayport sink
-internal_sink = alsa_output.pci-0000_05_00.6.analog-stereo ; default: the first other sink
 ```
 
 To power the machine off when Retrobox quits normally (exit status 0; a crash, Win+Shift+E or a restart never does), in any layer:
@@ -86,7 +84,7 @@ The session log is `~/.local/state/retrobox/logs/labwc-session.log`.
 ```
 install.sh    the installer: --check, install, --uninstall
 bin/          retrobox-labwc-session
-libexec/      display/audio switchers, retrobox-labwc-common.sh (settings, keyboard)
+libexec/      display switcher, retrobox-labwc-common.sh (settings, keyboard)
 share/        labwc config templates, the login hook
 tests/        smoke-test.sh (stand-in commands, throwaway HOME)
 ```
