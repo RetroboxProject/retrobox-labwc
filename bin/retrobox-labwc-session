@@ -34,6 +34,17 @@ SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 readonly SELF
 SCRIPT_DIR="$(dirname -- "${SELF}")"
 readonly SCRIPT_DIR
+
+# The login on the gaming TTY can hand the session ambient capabilities
+# (CAP_WAKE_ALARM has been seen; ssh logins don't get it). Everything started
+# from the session would inherit them, and bwrap, which Flatpak runs every app
+# in, refuses to start with capabilities it did not expect ("Unexpected
+# capabilities but not setuid"), so "flatpak run" hangs. Start over without
+# them; the second run finds none and goes on.
+if [[ "$(awk '/^CapAmb:/ {print $2}' /proc/self/status 2>/dev/null)" =~ [1-9a-f] ]] &&
+  command -v setpriv >/dev/null 2>&1; then
+  exec setpriv --inh-caps=-all --ambient-caps=-all -- "${SELF}" "$@"
+fi
 # shellcheck source=libexec/retrobox-labwc-common.sh
 source "${SCRIPT_DIR}/../libexec/retrobox-labwc-common.sh"
 
