@@ -23,11 +23,17 @@
 # The keyboard layout is the system's (/etc/default/keyboard, ...) and is
 # read again on every start, including a restart.
 #
+# D-Bus: the session uses the user's own bus (XDG_RUNTIME_DIR/bus, the one
+# systemd's user manager runs, so portals, pipewire and wireplumber are a
+# single set shared with the rest of the user's services). If that bus does
+# not exist, or RETROBOX_LABWC_PRIVATE_BUS is set, it starts a private one
+# with dbus-run-session instead.
+#
 # Usage: retrobox-labwc-session [-f]
 #   -f          Skip the "am I on the gaming TTY?" check.
 #   --restart   Restart the running session (Win+Shift+R): it starts over
 #               with the system keyboard as it is now.
-#   --inner     Internal: the part that runs inside dbus-run-session.
+#   --inner     Internal: the part that owns labwc and retrobox.
 set -uo pipefail # no "-e": the cleanup below must always run
 
 SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
@@ -117,8 +123,30 @@ import_labwc_env() {
   done <"${ENV_FILE}"
 }
 
+# What services started by a shared user bus need to find the compositor.
+readonly -a ACTIVATION_VARS=(DISPLAY WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE)
+
+# Only with the user's bus (RETROBOX_LABWC_USER_BUS): its services (portals,
+# ...) are started by systemd, outside this session's environment.
+share_env() {
+  if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+    dbus-update-activation-environment --systemd "${ACTIVATION_VARS[@]}" >>"${LOG_FILE}" 2>&1 || true
+  else
+    systemctl --user import-environment "${ACTIVATION_VARS[@]}" >>"${LOG_FILE}" 2>&1 || true
+  fi
+  # a portal left from an earlier session points at a compositor that is gone
+  systemctl --user try-restart 'xdg-desktop-portal*.service' >/dev/null 2>&1 || true
+  log "compositor environment shared with the user bus"
+}
+
+# shellcheck disable=SC2329  # runs as the EXIT trap
+unshare_env() {
+  systemctl --user unset-environment "${ACTIVATION_VARS[@]}" >/dev/null 2>&1 || true
+}
+
 # ---------------------------------------------------------------------
-# Inner half: runs inside dbus-run-session, owns labwc and retrobox.
+# Inner half: owns labwc and retrobox (inside dbus-run-session, or on the
+# user's bus).
 # ---------------------------------------------------------------------
 run_session() {
   local labwc_pid app_pid app_status=0 i
@@ -133,6 +161,10 @@ run_session() {
   log "starting ${labwc_cmd[*]}"
   "${labwc_cmd[@]}" &
   labwc_pid=$!
+
+  # A stop request (systemctl stop sends SIGTERM) closes retrobox, then labwc,
+  # right away instead of leaving them for the service's kill timeout.
+  trap 'log "stop requested"; stop_pid "${app_pid:-}" "retrobox"; stop_pid "${labwc_pid}" "labwc"; exit 143' TERM INT HUP
 
   # labwc's autostart writes ENV_FILE once the compositor is up, so its
   # appearance is the signal to start launching clients.
@@ -153,6 +185,10 @@ run_session() {
   fi
 
   import_labwc_env
+  if [[ -n "${RETROBOX_LABWC_USER_BUS:-}" ]]; then
+    share_env
+    trap unshare_env EXIT
+  fi
   log "labwc ready on ${WAYLAND_DISPLAY:-?} (pid ${labwc_pid}); starting ${RETROBOX_BIN}"
 
   "${RETROBOX_BIN}" &
@@ -222,7 +258,9 @@ if [[ -z "${RETROBOX_BIN}" ]]; then
   exit 1
 fi
 
-for cmd in labwc dbus-run-session; do
+need=(labwc)
+[[ -S "${RUNTIME_DIR}/bus" && -z "${RETROBOX_LABWC_PRIVATE_BUS:-}" ]] || need+=(dbus-run-session)
+for cmd in "${need[@]}"; do
   if ! command -v "${cmd}" >/dev/null 2>&1; then
     echo "error: ${cmd} not found (see: retrobox-labwc check)" >&2
     exit 1
@@ -284,7 +322,21 @@ kill_labwc() {
 # Backstop: whatever ends this script — retrobox finishing, labwc being
 # closed by hand, this being signalled — no labwc is left behind.
 trap kill_labwc EXIT
-trap 'exit 143' TERM INT HUP
+session_pid=""
+# A stop request: ask the inner half (which closes retrobox, then labwc) to
+# stop, give it time, then leave; the EXIT trap above is the backstop.
+# shellcheck disable=SC2329  # runs as the TERM trap
+on_stop() {
+  local i
+  log "stop requested"
+  [[ -z "${session_pid}" ]] || pkill -TERM -u "$(id -u)" -f -- "${SELF} --inner" 2>/dev/null
+  for ((i = 0; i < TERM_GRACE_SECS * 8; i++)); do
+    kill -0 "${session_pid:-0}" 2>/dev/null || break
+    sleep 0.25
+  done
+  exit 143
+}
+trap on_stop TERM INT HUP
 
 exit_status=0
 rm -f -- "${RESTART_FLAG}" "${QUIT_FLAG}"
@@ -293,7 +345,18 @@ while :; do
   export_keyboard_env
   log "Starting labwc gaming session on tty${GAMING_TTY} (${RETROBOX_BIN}; keyboard ${XKB_LAYOUT}${XKB_VARIANT:+ ${XKB_VARIANT}} from ${KB_SOURCE})"
 
-  dbus-run-session -- "${SELF}" --inner >>"${LOG_FILE}" 2>&1
+  # In the background and waited for, so a stop request is handled at once
+  # (bash would only run its trap after a foreground command ended).
+  if [[ -S "${RUNTIME_DIR}/bus" && -z "${RETROBOX_LABWC_PRIVATE_BUS:-}" ]]; then
+    log "using the user bus ${RUNTIME_DIR}/bus"
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" RETROBOX_LABWC_USER_BUS=1 \
+      "${SELF}" --inner >>"${LOG_FILE}" 2>&1 &
+  else
+    log "no user bus: starting a private one (dbus-run-session)"
+    env -u RETROBOX_LABWC_USER_BUS dbus-run-session -- "${SELF}" --inner >>"${LOG_FILE}" 2>&1 &
+  fi
+  session_pid=$!
+  wait "${session_pid}"
   exit_status=$?
   log "session ended with status ${exit_status}"
 
