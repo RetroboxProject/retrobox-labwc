@@ -4,6 +4,7 @@
 # HOME.
 #
 #   tests/smoke-test.sh
+# shellcheck disable=SC2015,SC2016  # "A && B || fail" is how the checks read
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -28,23 +29,33 @@ printf 'XKBMODEL="pc105"\nXKBLAYOUT="es"\nXKBVARIANT=""\nXKBOPTIONS="grp:alt_shi
 # --- stand-in commands -------------------------------------------------------------
 STUBS="${WORK}/stubs"
 mkdir -p "${STUBS}"
-for cmd in labwc pipewire-pulse foot dbus-run-session wlr-randr wpctl pactl Xwayland retrobox; do
+for cmd in labwc pipewire-pulse foot dbus-run-session wlr-randr wpctl pactl Xwayland chvt retrobox; do
   printf '#!/bin/sh\nexit 0\n' >"${STUBS}/${cmd}"
 done
 mkdir -p "${WORK}/core/bin"
 mv "${STUBS}/retrobox" "${WORK}/core/bin/retrobox"
 printf '#!/bin/sh\nexit 0\n' >"${WORK}/core/bin/retrobox-screenshot"
-# systemctl: getty@tty8 has an autologin drop-in for this user, tty2 for someone else
-cat >"${STUBS}/systemctl" <<SH
+# A fake systemd: units are the base ExecStart plus whatever drop-ins are in
+# RETROBOX_SYSTEMD_DIR; "enabled" is a marker file. sudo just runs the command.
+export RETROBOX_SYSTEMD_DIR="${WORK}/systemd"
+export STUB_STATE="${WORK}/state"
+mkdir -p "${RETROBOX_SYSTEMD_DIR}" "${STUB_STATE}"
+cat >"${STUBS}/systemctl" <<'SH'
 #!/bin/sh
-case "\$*" in
-  "cat getty@tty8.service") echo "ExecStart=-/sbin/agetty -o '-p -- \\\\u' --noclear %I \\\$TERM"; echo "ExecStart=-/sbin/agetty --autologin $(id -un) --noclear %I \\\$TERM" ;;
-  "cat getty@tty2.service") echo "ExecStart=-/sbin/agetty --autologin somebody --noclear %I \\\$TERM" ;;
-  "cat getty@tty"*) echo "ExecStart=-/sbin/agetty -o '-p -- \\\\u' --noclear %I \\\$TERM" ;;
-  "is-enabled"*) exit 0 ;;
+case "$1" in
+  cat)
+    tty="${2#getty@tty}"; tty="${tty%.service}"
+    echo "ExecStart=-/sbin/agetty -o '-p -- \\u' --noclear %I \$TERM"
+    cat "${RETROBOX_SYSTEMD_DIR}/getty@tty${tty}.service.d/"*.conf 2>/dev/null
+    exit 0 ;;
+  is-enabled) [ -e "${STUB_STATE}/enabled-$3" ] ;;
+  enable) touch "${STUB_STATE}/enabled-$2" ;;
+  disable) rm -f "${STUB_STATE}/enabled-$2" ;;
+  daemon-reload) exit 0 ;;
   *) exit 1 ;;
 esac
 SH
+printf '#!/bin/sh\nexec "$@"\n' >"${STUBS}/sudo"
 chmod +x "${STUBS}"/* "${WORK}/core/bin/"*
 export RETROBOX_ROOT="${WORK}/core"
 BASE_PATH="${PATH}"
@@ -71,22 +82,33 @@ grep -q 'pipewire-pulse is not installed' "${WORK}/out" || fail "pipewire-pulse 
 touch "${WORK}/units/pipewire-pulse.service"
 pass "pipewire-pulse needs its systemd unit, not just the command"
 
-# --- 2. autologin checks --------------------------------------------------------------
-install_sh --check --tty 8 >"${WORK}/out" 2>&1 || fail "check on tty8 failed: $(cat "${WORK}/out")"
-grep -q 'tty8 logs .* in by itself' "${WORK}/out" || fail "autologin not detected"
-grep -q 'Keyboard: es' "${WORK}/out" || fail "keyboard not reported"
-expect_fail install_sh --check --tty 3
-grep -q 'tty3 has no autologin' "${WORK}/out" || fail "missing autologin not reported"
-grep -q 'autologin.conf' "${WORK}/out" || fail "no autologin hint"
+# --- 2. the checks of the TTY: read-only, with the way to fix it -------------------------
+expect_fail install_sh --check --tty 8
+grep -q 'tty8 has no autologin' "${WORK}/out" || fail "missing autologin not reported"
+grep -q 'does not boot on tty8' "${WORK}/out" || fail "missing boot not reported"
+grep -q 'retrobox-labwc.conf' "${WORK}/out" && grep -q 'chvt 8' "${WORK}/out" || fail "no hint with the VT switch"
+[[ -z "$(ls -A "${RETROBOX_SYSTEMD_DIR}")" ]] || fail "--check wrote to the system"
+expect_fail install_sh --check --tty 1
+grep -q 'chvt' "${WORK}/out" && fail "tty1 needs no VT switch"
+mkdir -p "${RETROBOX_SYSTEMD_DIR}/getty@tty2.service.d"
+printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin somebody --noclear %%I $TERM\n' >"${RETROBOX_SYSTEMD_DIR}/getty@tty2.service.d/autologin.conf"
 expect_fail install_sh --check --tty 2
 grep -q "logs 'somebody' in" "${WORK}/out" || fail "other user's autologin not reported"
-pass "autologin is detected, and its absence or another user is reported"
+expect_fail install_sh --tty 2
+grep -q "already logs 'somebody' in" "${WORK}/out" || fail "install over another user's autologin"
+pass "the TTY checks are read-only; another user's autologin is never overridden"
 
-# --- 3. install ---------------------------------------------------------------------
+# --- 3. install (sets the TTY up through sudo) --------------------------------------------
 printf '# my profile\nexport FOO=1' >"${HOME}/.profile" # no trailing newline on purpose
 expect_fail install_sh                                    # no --tty the first time
-install_sh --tty 3 >"${WORK}/out" 2>&1 && fail "installed on a tty without autologin"
+expect_fail install_sh --no-system --tty 8
+grep -q 'not set up and --no-system' "${WORK}/out" || fail "--no-system did not refuse"
+[[ ! -e "${HOME}/.local/share/retrobox-labwc" ]] || fail "--no-system left files behind"
 install_sh --tty 8 >"${WORK}/out" 2>&1 || fail "install failed: $(cat "${WORK}/out")"
+DROPIN="${RETROBOX_SYSTEMD_DIR}/getty@tty8.service.d/retrobox-labwc.conf"
+grep -q -- "--autologin $(id -un)" "${DROPIN}" && grep -q 'ExecStartPre=-.*chvt 8' "${DROPIN}" || fail "drop-in wrong: $(cat "${DROPIN}")"
+[[ -e "${STUB_STATE}/enabled-getty@tty8.service" ]] || fail "getty not enabled at boot"
+install_sh --check --tty 8 >/dev/null 2>&1 || fail "check fails after the install"
 DATA="${HOME}/.local/share/retrobox-labwc"
 [[ -x "${DATA}/install.sh" && -x "${DATA}/bin/retrobox-labwc-session" ]] || fail "tree not copied"
 grep -q 'labwc_tty = 8' "${HOME}/.config/retrobox/retrobox.ini.d/50-labwc.ini" || fail "tty not written"
@@ -111,9 +133,24 @@ pass "the TTY cannot change without uninstall; re-install is idempotent"
 "${DATA}/install.sh" --uninstall >/dev/null 2>&1 || fail "uninstall failed"
 [[ ! -e "${DATA}" && ! -e "${HOME}/.config/retrobox-labwc" && ! -e "${HOME}/.config/retrobox/retrobox.ini.d/50-labwc.ini" ]] || fail "files left"
 [[ "$(cat "${HOME}/.profile")" == $'# my profile\nexport FOO=1' ]] || fail "profile not restored: $(cat "${HOME}/.profile")"
-install_sh --tty 2 --force >/dev/null 2>&1 || fail "--force install failed"
+[[ ! -e "${DROPIN}" && ! -e "${STUB_STATE}/enabled-getty@tty8.service" ]] || fail "system part not undone"
+[[ -e "${RETROBOX_SYSTEMD_DIR}/getty@tty2.service.d/autologin.conf" ]] || fail "uninstall touched a drop-in that is not ours"
+pass "uninstall restores the profile and undoes the system part"
+
+# --- 5b. tty1 needs no VT switch; an autologin of yours is kept and only completed ---------
+install_sh --tty 1 >/dev/null 2>&1 || fail "install on tty1 failed"
+D1="${RETROBOX_SYSTEMD_DIR}/getty@tty1.service.d/retrobox-labwc.conf"
+grep -q -- '--autologin' "${D1}" && ! grep -q chvt "${D1}" || fail "tty1 drop-in wrong: $(cat "${D1}")"
+[[ ! -e "${STUB_STATE}/enabled-getty@tty1.service" ]] || fail "tty1 getty enabled needlessly"
 "${HOME}/.local/share/retrobox-labwc/install.sh" --uninstall >/dev/null 2>&1
-pass "uninstall restores the profile; --tty can change afterwards"
+mkdir -p "${RETROBOX_SYSTEMD_DIR}/getty@tty3.service.d"
+printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin %s --noclear %%I $TERM\n' "$(id -un)" >"${RETROBOX_SYSTEMD_DIR}/getty@tty3.service.d/autologin.conf"
+install_sh --tty 3 >/dev/null 2>&1 || fail "install on a tty with your own autologin failed"
+D3="${RETROBOX_SYSTEMD_DIR}/getty@tty3.service.d/retrobox-labwc.conf"
+grep -q 'chvt 3' "${D3}" && ! grep -q -- '--autologin' "${D3}" || fail "own autologin overridden: $(cat "${D3}")"
+"${HOME}/.local/share/retrobox-labwc/install.sh" --uninstall >/dev/null 2>&1
+[[ -e "${RETROBOX_SYSTEMD_DIR}/getty@tty3.service.d/autologin.conf" && ! -e "${D3}" ]] || fail "uninstall on tty3 wrong"
+pass "tty1 gets no VT switch; your own autologin is kept and only completed"
 
 # --- 6. a profile that does not exist yet is created, and removed again --------------------
 rm -f "${HOME}/.profile"

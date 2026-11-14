@@ -22,17 +22,7 @@ Installed by you, with your package manager (`./install.sh --check --tty N` tell
 | dbus-run-session | `dbus-bin` | `dbus` |
 | recommended | `wlr-randr wireplumber pulseaudio-utils xwayland` | `wlr-randr wireplumber libpulse xorg-xwayland` |
 
-plus `retrobox-core`, and systemd with a `getty` autologin on the gaming TTY. The installer **checks** the autologin and, if it is missing, prints the drop-in to create (that part is system-wide, so it is yours to do):
-
-```bash
-sudo mkdir -p /etc/systemd/system/getty@tty1.service.d
-sudo tee /etc/systemd/system/getty@tty1.service.d/autologin.conf >/dev/null <<'CONF'
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin YOUR_USER --noclear %I $TERM
-CONF
-sudo systemctl daemon-reload
-```
+plus `retrobox-core` and systemd. For any TTY but 1, `chvt` (package `kbd`) is needed too.
 
 ## Install
 
@@ -40,6 +30,8 @@ sudo systemctl daemon-reload
 git clone https://github.com/RetroboxProject/retrobox-labwc && cd retrobox-labwc
 ./install.sh --tty 1        # --check --tty 1 only checks; --force installs even if a check fails
 ```
+
+The machine should log in on the gaming TTY by itself and boot on it. If that is not so yet, the installer sets it up, and this is the only thing that needs root (it asks for your password through `sudo`; `--no-system` skips it): a drop-in `/etc/systemd/system/getty@ttyN.service.d/retrobox-labwc.conf` with the getty autologin and, for any TTY but 1, a switch to it at boot (`chvt N`), plus `systemctl enable getty@ttyN`. An autologin you already have on that TTY is kept and only completed; one for another user is never overridden. `./install.sh --check` prints what it would write.
 
 Everything lands in your home:
 
@@ -50,7 +42,7 @@ Everything lands in your home:
 
 **The TTY is fixed once installed.** To change it: `~/.local/share/retrobox-labwc/install.sh --uninstall`, then install again. Running the installer again with the same TTY just updates.
 
-`--uninstall` removes all of the above (and restores your profile). It leaves the getty autologin alone, since it lives in `/etc`.
+`--uninstall` removes all of the above, restores your profile and undoes the system part (the drop-in and the `enable` it made; an autologin of your own stays).
 
 ## Keyboard
 

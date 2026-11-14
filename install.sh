@@ -8,6 +8,14 @@
 #   * labwc, pipewire-pulse and a terminal (foot or alacritty) are installed
 #     (also dbus-run-session, which the session needs; the rest is advice)
 #   * the gaming TTY logs your user in by itself (systemd getty autologin)
+#     and the machine boots on it
+#
+# If the TTY does not log in by itself yet, or the machine does not boot on
+# it, the installer sets that up (the only thing that needs root: it asks
+# for your password through sudo): a drop-in
+# /etc/systemd/system/getty@ttyN.service.d/retrobox-labwc.conf with the
+# autologin and, for any TTY but 1, a VT switch to it at boot, and the getty
+# enabled at boot. Pass --no-system to leave the system alone.
 #
 # It sets up, in your home only:
 #   * ~/.local/share/retrobox-labwc    this tree (so the checkout can go)
@@ -23,13 +31,14 @@
 #
 # Once installed, the TTY cannot be changed: uninstall first, then install.
 #
-# Usage: ./install.sh [--tty N] [--force]
+# Usage: ./install.sh [--tty N] [--no-system] [--force]
 #        ./install.sh --check [--tty N]
 #        ./install.sh --uninstall
 #   --tty N       gaming TTY (1-12); required the first time
 #   --check       only run the checks, change nothing
+#   --no-system   never touch /etc (no sudo): a missing autologin is an error
 #   --force       install even if a check fails
-#   --uninstall   remove everything this script set up (nothing under /etc)
+#   --uninstall   remove everything this script set up, /etc drop-in included
 #   -h, --help
 set -euo pipefail
 
@@ -50,6 +59,7 @@ readonly TTY_DROPIN="${RETROBOX_CONFIG_DIR}/retrobox.ini.d/50-labwc.ini"
 readonly MANIFEST="${DATA_DIR}/.install-manifest"
 readonly BIN_DIR="${HOME}/.local/bin"
 readonly SESSION_LINK="${BIN_DIR}/retrobox-labwc-session"
+readonly SYSTEMD_DIR="${RETROBOX_SYSTEMD_DIR:-/etc/systemd/system}"
 readonly OS_RELEASE="${RETROBOX_OS_RELEASE:-/etc/os-release}"
 # the files bash reads for a login shell, in the order it tries them
 readonly PROFILES=(".bash_profile" ".bash_login" ".profile")
@@ -148,6 +158,7 @@ check_optional() {
 }
 
 check_dependencies() {
+  local tty="$1"
   check_required labwc labwc labwc
   if have pipewire-pulse && { ! have systemctl || pipewire_pulse_unit; }; then
     ok "pipewire-pulse: $(command -v pipewire-pulse)"
@@ -158,6 +169,7 @@ check_dependencies() {
   fi
   check_required terminal "terminal (foot or alacritty)" foot alacritty
   check_required dbus "dbus-run-session" dbus-run-session
+  ((tty == 1)) || check_required kbd "chvt (to boot on tty${tty})" chvt
   check_optional wlr-randr wlr-randr "Win+P, the display switch" wlr-randr
   check_optional wireplumber wpctl "the volume keys" wpctl
   check_optional pactl pactl "Win+O, the audio output switch" pactl
@@ -200,24 +212,25 @@ autologin_user() {
   printf '%s\n' "${user}"
 }
 
-print_autologin_hint() {
-  local tty="$1" agetty
-  agetty="$(PATH="${PATH}:/usr/sbin:/sbin" command -v agetty || true)"
-  agetty="${agetty:-/sbin/agetty}"
-  info "To make tty${tty} log ${USER_NAME} in by itself, run:"
-  cat <<EOF
-  sudo mkdir -p /etc/systemd/system/getty@tty${tty}.service.d
-  sudo tee /etc/systemd/system/getty@tty${tty}.service.d/autologin.conf >/dev/null <<'CONF'
-[Service]
-ExecStart=
-ExecStart=-${agetty} --autologin ${USER_NAME} --noclear %I \$TERM
-CONF
-  sudo systemctl daemon-reload
-EOF
+# True if the machine boots on TTY: tty1 always does; any other needs its
+# getty enabled at boot and a VT switch to it.
+boots_on_tty() {
+  local tty="$1"
+  ((tty == 1)) && return 0
+  have systemctl || return 1
+  systemctl is-enabled --quiet "getty@tty${tty}.service" 2>/dev/null || return 1
+  systemctl cat "getty@tty${tty}.service" 2>/dev/null | grep -qE "^ExecStartPre=.*chvt[[:space:]]+${tty}([[:space:]]|\$)"
 }
 
-check_autologin() {
+# What the system part needs; set by check_system_tty.
+NEED_AUTOLOGIN=0
+NEED_BOOT=0
+OTHER_USER=""
+
+check_system_tty() {
   local tty="$1" user rc=0
+  NEED_AUTOLOGIN=0 NEED_BOOT=0 OTHER_USER=""
+
   user="$(autologin_user "${tty}")" || rc=$?
   case "${rc}" in
   0)
@@ -225,26 +238,81 @@ check_autologin() {
       ok "tty${tty} logs ${USER_NAME} in by itself"
     else
       bad "tty${tty} logs '${user}' in by itself, not ${USER_NAME}"
-      FAILED=1
-      print_autologin_hint "${tty}"
+      OTHER_USER="${user}"
     fi
     ;;
   1)
     bad "tty${tty} has no autologin"
-    FAILED=1
-    print_autologin_hint "${tty}"
+    NEED_AUTOLOGIN=1
     ;;
   *)
     bad "cannot tell if tty${tty} has autologin: this needs a running systemd"
     FAILED=1
+    return 0
     ;;
   esac
 
-  # logind only starts getty on demand for the first NAutoVTs (6) consoles
-  if ((tty > 6)) && have systemctl && ! systemctl is-enabled --quiet "getty@tty${tty}.service" 2>/dev/null; then
-    warn "tty${tty} is above logind's default of 6 on-demand consoles; unless you changed that, run:"
-    warn "  sudo systemctl enable getty@tty${tty}.service"
+  if boots_on_tty "${tty}"; then
+    ok "the machine boots on tty${tty}"
+  else
+    bad "the machine does not boot on tty${tty}"
+    NEED_BOOT=1
   fi
+}
+
+# dropin_content TTY: the getty drop-in for what is needed (NEED_*).
+dropin_content() {
+  local tty="$1" agetty chvt
+  agetty="$(PATH="${PATH}:/usr/sbin:/sbin" command -v agetty || true)"
+  agetty="${agetty:-/sbin/agetty}"
+  chvt="$(PATH="${PATH}:/usr/sbin:/sbin" command -v chvt || true)"
+  chvt="${chvt:-/usr/bin/chvt}"
+  printf '# Written %s: the labwc gaming session starts from this login.\n[Service]\n' "${GENERATED_MARK}"
+  if ((NEED_AUTOLOGIN == 1)); then
+    # shellcheck disable=SC2016  # $TERM is for agetty/systemd, not for us
+    printf 'ExecStart=\nExecStart=-%s --autologin %s --noclear %%I $TERM\n' "${agetty}" "${USER_NAME}"
+  fi
+  if ((NEED_BOOT == 1)); then
+    printf 'ExecStartPre=-%s %s\n' "${chvt}" "${tty}"
+  fi
+}
+
+dropin_path() {
+  printf '%s/getty@tty%s.service.d/retrobox-labwc.conf\n' "${SYSTEMD_DIR}" "$1"
+}
+
+print_system_hint() {
+  local tty="$1" file
+  file="$(dropin_path "${tty}")"
+  info "install.sh sets this up for you (with sudo); by hand it is:"
+  echo "  sudo mkdir -p $(dirname -- "${file}")"
+  echo "  sudo tee ${file} >/dev/null <<'CONF'"
+  dropin_content "${tty}"
+  echo "CONF"
+  ((tty == 1)) || echo "  sudo systemctl enable getty@tty${tty}.service"
+  echo "  sudo systemctl daemon-reload"
+}
+
+# Makes TTY log in by itself and the machine boot on it. Records what it
+# did in SYSTEM_NOTES for the manifest (so --uninstall can undo exactly it).
+SYSTEM_NOTES=""
+PREV_NOTES=""
+install_system() {
+  local tty="$1" file tmp
+  file="$(dropin_path "${tty}")"
+  have sudo || die "sudo is needed to set up tty${tty} (or do it yourself and use --no-system)"
+  info "Setting up tty${tty} (sudo): ${file}"
+  tmp="$(mktemp)"
+  dropin_content "${tty}" >"${tmp}"
+  sudo install -d -m 0755 -- "$(dirname -- "${file}")" || die "sudo failed"
+  sudo install -m 0644 -- "${tmp}" "${file}" || die "sudo failed"
+  rm -f -- "${tmp}"
+  SYSTEM_NOTES="system_dropin=${file}"$'\n'
+  if ((tty != 1)) && ! systemctl is-enabled --quiet "getty@tty${tty}.service" 2>/dev/null; then
+    sudo systemctl enable "getty@tty${tty}.service" >/dev/null 2>&1 || die "could not enable getty@tty${tty}"
+    SYSTEM_NOTES+="getty_enabled=1"$'\n'
+  fi
+  sudo systemctl daemon-reload
 }
 
 report_keyboard() {
@@ -403,6 +471,8 @@ remove_legacy() {
 do_install() {
   local prev
 
+  # what an earlier run did to the system, kept when this one has nothing to add
+  PREV_NOTES="$(grep -E '^(system_dropin|getty_enabled)=' "${MANIFEST}" 2>/dev/null || true)"
   if prev="$(installed_tty)"; then
     if [[ -n "${TTY_ARG}" ]] && ((10#${TTY_ARG} != 10#${prev})); then
       die "already installed on tty${prev}: run ./install.sh --uninstall before using tty${TTY_ARG}"
@@ -415,12 +485,23 @@ do_install() {
   fi
 
   info "Checking the system for tty${TTY}..."
-  check_dependencies
-  check_autologin "${TTY}"
+  check_dependencies "${TTY}"
+  check_system_tty "${TTY}"
   report_keyboard
+  [[ -z "${OTHER_USER}" ]] || die "tty${TTY} already logs '${OTHER_USER}' in: pick another tty, or change it yourself"
   if ((FAILED == 1)); then
     ((FORCE == 1)) || die "fix what is marked [MISS] above and run it again (or use --force)"
     warn "Installing anyway (--force)."
+  fi
+  if ((NEED_AUTOLOGIN + NEED_BOOT > 0)); then
+    if ((SYSTEM == 1)); then
+      install_system "${TTY}"
+    elif ((FORCE == 1)); then
+      warn "tty${TTY} is not set up (--no-system): the session will not start by itself."
+    else
+      print_system_hint "${TTY}"
+      die "tty${TTY} is not set up and --no-system was given (or use --force)"
+    fi
   fi
 
   case "${DATA_DIR}${CONFIG_DIR}" in
@@ -438,15 +519,37 @@ do_install() {
   ln -sfn -- "${DATA_DIR}/bin/retrobox-labwc-session" "${SESSION_LINK}"
   [[ ":${PATH}:" == *":${BIN_DIR}:"* ]] || warn "${BIN_DIR} is not in your PATH (retrobox-labwc-session is linked there)."
 
-  printf 'tty=%s\nuser=%s\ndate=%s\n' "${TTY}" "${USER_NAME}" "$(date -Iseconds)" >"${MANIFEST}"
+  [[ -n "${SYSTEM_NOTES}" || -z "${PREV_NOTES}" ]] || SYSTEM_NOTES="${PREV_NOTES}"$'\n'
+  printf 'tty=%s\nuser=%s\ndate=%s\n%s' "${TTY}" "${USER_NAME}" "$(date -Iseconds)" "${SYSTEM_NOTES}" >"${MANIFEST}"
   ok "Installed. Log in on tty${TTY} (or reboot) to start the session."
   info "Remove it with: ${DATA_DIR}/install.sh --uninstall"
 }
 
 # ------------------------------------------------------------- uninstall
+# Undoes what install_system recorded in the manifest.
+uninstall_system() {
+  local dropin enabled tty
+  dropin="$(sed -n 's/^system_dropin=//p' "${MANIFEST}" 2>/dev/null | head -n1)"
+  enabled="$(sed -n 's/^getty_enabled=//p' "${MANIFEST}" 2>/dev/null | head -n1)"
+  tty="$(installed_tty || true)"
+  [[ -n "${dropin}" ]] || return 1
+  if ((SYSTEM == 0)) || ! have sudo; then
+    warn "Left in the system (remove as root): ${dropin}"
+    [[ -z "${enabled}" ]] || warn "  and: systemctl disable getty@tty${tty}.service"
+    return 0
+  fi
+  info "Removing ${dropin} (sudo)..."
+  grep -qsF "${GENERATED_MARK}" "${dropin}" && sudo rm -f -- "${dropin}"
+  sudo rmdir --ignore-fail-on-non-empty -- "$(dirname -- "${dropin}")" 2>/dev/null || true
+  [[ -z "${enabled}" ]] || sudo systemctl disable "getty@tty${tty}.service" >/dev/null 2>&1 || true
+  sudo systemctl daemon-reload
+}
+
 do_uninstall() {
   local name found=0
   cd /
+
+  if uninstall_system; then found=1; fi
 
   for name in "${PROFILES[@]}"; do
     if grep -qsF "${BLOCK_BEGIN}" "${HOME}/${name}"; then
@@ -480,13 +583,14 @@ do_uninstall() {
   if ((found == 0)); then
     info "Nothing to remove."
   else
-    ok "Removed. Left alone, because it is system-wide: the getty autologin drop-in (/etc/systemd/system/getty@tty*.service.d)."
+    ok "Removed. An autologin you set up yourself (not by this script) is left alone."
   fi
 }
 
 # ------------------------------------------------------------------ main
 TTY_ARG=""
 FORCE=0
+SYSTEM=1
 CHECK_ONLY=0
 UNINSTALL=0
 while (($# > 0)); do
@@ -497,6 +601,10 @@ while (($# > 0)); do
     ;;
   --force)
     FORCE=1
+    shift
+    ;;
+  --no-system)
+    SYSTEM=0
     shift
     ;;
   --check)
@@ -529,9 +637,14 @@ if ((CHECK_ONLY == 1)); then
   TTY="$(installed_tty || true)"
   if [[ -n "${TTY_ARG}" ]]; then TTY="$((10#${TTY_ARG}))"; fi
   [[ -n "${TTY}" ]] || die "which TTY? use --check --tty N"
-  check_dependencies
-  check_autologin "${TTY}"
+  check_dependencies "${TTY}"
+  check_system_tty "${TTY}"
   report_keyboard
+  [[ -z "${OTHER_USER}" ]] || FAILED=1
+  if ((NEED_AUTOLOGIN + NEED_BOOT > 0)); then
+    FAILED=1
+    print_system_hint "${TTY}"
+  fi
   exit "${FAILED}"
 fi
 
