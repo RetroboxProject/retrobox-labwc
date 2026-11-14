@@ -103,7 +103,7 @@ install_sh --tty 8 >"${WORK}/out" 2>&1 || fail "install failed: $(cat "${WORK}/o
 DATA="${HOME}/.local/share/retrobox-labwc"
 grep -q "^User=$(id -un)\$" "${UNIT}" && grep -q '^TTYPath=/dev/tty8$' "${UNIT}" && grep -q '^Conflicts=getty@tty8.service$' "${UNIT}" || fail "unit wrong: $(cat "${UNIT}")"
 grep -q '^Environment=RETROBOX_LABWC_TTY=8$' "${UNIT}" && grep -q "^ExecStart=/bin/bash -lc 'exec ${DATA}/bin/retrobox-labwc-session'\$" "${UNIT}" || fail "unit does not run the session: $(cat "${UNIT}")"
-grep -q '^ExecStopPost=+-.* --no-block start getty@tty8.service$' "${UNIT}" && grep -q '^ExecStartPre=+-.*chvt 8$' "${UNIT}" || fail "unit does not give the tty back: $(cat "${UNIT}")"
+grep -q '^ExecStopPost=+-/bin/sh -c .*list-jobs.*retrobox-labwc.service +(start|restart).* --no-block start getty@tty8.service.$' "${UNIT}" && grep -q '^ExecStartPre=+-.*chvt 8$' "${UNIT}" || fail "unit does not give the tty back: $(cat "${UNIT}")"
 [[ -e "${STUB_STATE}/enabled-retrobox-labwc.service" ]] || fail "service not enabled at boot"
 install_sh --check --tty 8 >/dev/null 2>&1 || fail "check fails after the install"
 [[ -x "${DATA}/install.sh" && -x "${DATA}/bin/retrobox-labwc-session" ]] || fail "tree not copied"
@@ -167,7 +167,7 @@ install_sh --tty 8 --on-quit shell >/dev/null 2>&1
 RUNS="${WORK}/runs"
 : >"${RUNS}"
 # dbus-run-session -- CMD...
-printf '#!/bin/sh\nshift\nexec "$@"\n' >"${STUBS}/dbus-run-session"
+printf '#!/bin/sh\necho private-bus >>"%s"\nshift\nexec "$@"\n' "${RUNS}" >"${STUBS}/dbus-run-session"
 # labwc [-C DIR]: runs the autostart like labwc does, records its keyboard, lives until killed
 cat >"${STUBS}/labwc" <<SH
 #!/bin/sh
@@ -202,6 +202,36 @@ wait "${SESSION}" || fail "session exited with an error"
 grep -q 'labwc layout=fr' "${RUNS}" || fail "restart did not pick up the new keyboard: $(cat "${RUNS}")"
 pgrep -u "$(id -u)" -f "sleep 30" >/dev/null && pkill -u "$(id -u)" -f "sleep 30" || true
 pass "the session starts, restarts on request and re-reads the keyboard"
+
+# --- 8b. a stop request (systemctl stop) closes labwc and retrobox promptly --------------
+printf '#!/bin/sh\necho "retrobox display=\$WAYLAND_DISPLAY" >>"%s"\nexec sleep 30\n' "${RUNS}" >"${WORK}/core/bin/retrobox"
+chmod +x "${WORK}/core/bin/retrobox"
+: >"${RUNS}"
+"${HOME}/.local/bin/retrobox-labwc-session" -f &
+SESSION=$!
+for _ in $(seq 1 100); do grep -q '^retrobox' "${RUNS}" && break; sleep 0.1; done
+kill -TERM "${SESSION}"
+for _ in $(seq 1 80); do kill -0 "${SESSION}" 2>/dev/null || break; sleep 0.1; done
+! kill -0 "${SESSION}" 2>/dev/null || fail "the session did not stop on SIGTERM within 8s"
+wait "${SESSION}" 2>/dev/null || true
+! pgrep -u "$(id -u)" -x labwc >/dev/null || fail "labwc left behind after a stop request"
+pass "SIGTERM stops the whole session promptly"
+
+# --- 8c. the user's own bus is used when it exists; a private one is the fallback ------------
+printf '#!/bin/sh\necho "bus=$DBUS_SESSION_BUS_ADDRESS user=${RETROBOX_LABWC_USER_BUS:-}" >>"%s"\nexit 0\n' "${RUNS}" >"${WORK}/core/bin/retrobox"
+chmod +x "${WORK}/core/bin/retrobox"
+: >"${RUNS}"
+"${HOME}/.local/bin/retrobox-labwc-session" -f || fail "session without a user bus failed"
+grep -q '^private-bus$' "${RUNS}" && grep -q 'user=$' "${RUNS}" || fail "no private bus without a user bus: $(cat "${RUNS}")"
+python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "${XDG_RUNTIME_DIR}/bus"
+: >"${RUNS}"
+"${HOME}/.local/bin/retrobox-labwc-session" -f || fail "session on the user bus failed"
+grep -q "bus=unix:path=${XDG_RUNTIME_DIR}/bus user=1" "${RUNS}" && ! grep -q '^private-bus$' "${RUNS}" || fail "user bus not used: $(cat "${RUNS}")"
+: >"${RUNS}"
+RETROBOX_LABWC_PRIVATE_BUS=1 "${HOME}/.local/bin/retrobox-labwc-session" -f || fail "forced private bus failed"
+grep -q '^private-bus$' "${RUNS}" || fail "RETROBOX_LABWC_PRIVATE_BUS ignored"
+rm -f "${XDG_RUNTIME_DIR}/bus"
+pass "the session uses the user bus when there is one, dbus-run-session otherwise"
 
 # --- 9. on_quit = poweroff: only a normal quit of retrobox powers off ---------------------
 [[ ! -e "${STUB_STATE}/poweroff" ]] || fail "powered off without being asked"

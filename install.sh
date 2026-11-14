@@ -114,6 +114,9 @@ pkg_name() {
   pacman:polkit) echo polkit ;;
   apt:pipewire-pulse | pacman:pipewire-pulse) echo pipewire-pulse ;;
   dnf:pipewire-pulse) echo pipewire-pulseaudio ;;
+  apt:dbus-user-session) echo dbus-user-session ;;
+  pacman:dbus-user-session) echo dbus ;;
+  dnf:dbus-user-session) echo dbus-broker ;;
   apt:dbus) echo dbus-bin ;;
   pacman:dbus) echo dbus ;;
   dnf:dbus) echo dbus-daemon ;;
@@ -124,17 +127,23 @@ pkg_name() {
   esac
 }
 
-# True if systemd's user units include pipewire-pulse (Arch ships the
-# pipewire-pulse command inside the pipewire package, so the command alone
-# proves nothing there).
-pipewire_pulse_unit() {
-  local dir
+# user_unit_exists FILE...: true if systemd's user units include any of them.
+user_unit_exists() {
+  local dir file
   local -a dirs
   IFS=: read -r -a dirs <<<"${RETROBOX_USER_UNIT_DIRS:-/usr/lib/systemd/user:/lib/systemd/user:/etc/systemd/user}"
   for dir in "${dirs[@]}"; do
-    [[ -e "${dir}/pipewire-pulse.service" || -e "${dir}/pipewire-pulse.socket" ]] && return 0
+    for file in "$@"; do
+      [[ -e "${dir}/${file}" ]] && return 0
+    done
   done
   return 1
+}
+
+# pipewire-pulse's unit: Arch ships the pipewire-pulse command inside the
+# pipewire package, so the command alone proves nothing there.
+pipewire_pulse_unit() {
+  user_unit_exists pipewire-pulse.service pipewire-pulse.socket
 }
 
 MISSING_REQUIRED=()
@@ -178,6 +187,10 @@ check_dependencies() {
   fi
   check_required terminal "terminal (foot or alacritty)" foot alacritty
   check_required dbus "dbus-run-session" dbus-run-session
+  if have systemctl && ! user_unit_exists dbus.socket; then
+    warn "no systemd user bus (dbus-user-session): the session falls back to a private bus, with a second set of portals"
+    MISSING_OPTIONAL+=(dbus-user-session)
+  fi
   ((tty == 1)) || check_required kbd "chvt (to boot on tty${tty})" chvt
   check_optional wlr-randr wlr-randr "Win+P, the display switch" wlr-randr
   check_optional wireplumber wpctl "the volume keys" wpctl
@@ -220,7 +233,10 @@ unit_path() {
 # unit_content TTY: the service. It takes TTY over from its getty (Conflicts=),
 # logs USER_NAME in through PAM (a real logind session on the seat, which is
 # what labwc needs) and runs the session from a login shell, so your PATH is
-# the one of your profile. When it ends, however it ends, the getty comes back.
+# the one of your profile. When it ends, however it ends, the getty comes back,
+# unless a start or restart of this service is already queued: the getty's
+# own start would cancel it, and "systemctl restart" would stop the session
+# and never start it again.
 unit_content() {
   local tty="$1" chvt systemctl_bin
   chvt="$(PATH="${PATH}:/usr/sbin:/sbin" command -v chvt || true)"
@@ -251,9 +267,9 @@ UtmpMode=user
 Environment=RETROBOX_LABWC_TTY=${tty}
 ExecStartPre=+-${chvt} ${tty}
 ExecStart=/bin/bash -lc 'exec ${DATA_DIR}/bin/retrobox-labwc-session'
-ExecStopPost=+-${systemctl_bin} --no-block start getty@tty${tty}.service
+ExecStopPost=+-/bin/sh -c '${systemctl_bin} list-jobs --no-legend | grep -qE "${UNIT_NAME} +(start|restart)" || exec ${systemctl_bin} --no-block start getty@tty${tty}.service'
 Restart=no
-TimeoutStopSec=20
+TimeoutStopSec=12
 
 [Install]
 WantedBy=multi-user.target
