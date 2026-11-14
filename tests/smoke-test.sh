@@ -52,6 +52,7 @@ case "$1" in
   enable) touch "${STUB_STATE}/enabled-$2" ;;
   disable) rm -f "${STUB_STATE}/enabled-$2" ;;
   daemon-reload) exit 0 ;;
+  poweroff) touch "${STUB_STATE}/poweroff" ;;
   *) exit 1 ;;
 esac
 SH
@@ -212,5 +213,18 @@ wait "${SESSION}" || fail "session exited with an error"
 grep -q 'labwc layout=fr' "${RUNS}" || fail "restart did not pick up the new keyboard: $(cat "${RUNS}")"
 pgrep -u "$(id -u)" -f "sleep 30" >/dev/null && pkill -u "$(id -u)" -f "sleep 30" || true
 pass "the session starts, restarts on request and re-reads the keyboard"
+
+# --- 9. on_quit = poweroff: only a normal quit of retrobox powers off ---------------------
+[[ ! -e "${STUB_STATE}/poweroff" ]] || fail "powered off without being asked"
+printf '#!/bin/sh\nexit 0\n' >"${WORK}/core/bin/retrobox"
+mkdir -p "${HOME}/.config/retrobox/retrobox.ini.d"
+printf '[labwc]\non_quit = poweroff\n' >"${HOME}/.config/retrobox/retrobox.ini.d/60-quit.ini"
+"${HOME}/.local/bin/retrobox-labwc-session" -f || fail "session failed"
+[[ -e "${STUB_STATE}/poweroff" ]] || fail "no poweroff after a normal quit"
+rm -f "${STUB_STATE}/poweroff"
+printf '#!/bin/sh\nexit 3\n' >"${WORK}/core/bin/retrobox"
+"${HOME}/.local/bin/retrobox-labwc-session" -f || true
+[[ ! -e "${STUB_STATE}/poweroff" ]] || fail "powered off after a crash"
+pass "on_quit = poweroff powers off after a normal quit, never after a failure"
 
 echo "All smoke tests passed."

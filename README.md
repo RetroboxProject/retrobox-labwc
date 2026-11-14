@@ -66,6 +66,15 @@ external_sink = alsa_output.pci-0000_01_00.1.hdmi-stereo   ; default: the first 
 internal_sink = alsa_output.pci-0000_05_00.6.analog-stereo ; default: the first other sink
 ```
 
+To power the machine off when Retrobox quits normally (exit status 0; a crash, Win+Shift+E or a restart never does), in any layer:
+
+```ini
+[labwc]
+on_quit = poweroff              ; default: shell (you are left at the prompt)
+```
+
+It runs `systemctl poweroff` as your user, which needs polkit on a minimal system (`polkitd`, which lets the active local session power off); check it with `systemctl poweroff` from a shell on the gaming TTY before relying on it.
+
 The session log is `~/.local/state/retrobox/logs/labwc-session.log`.
 
 ## Layout
