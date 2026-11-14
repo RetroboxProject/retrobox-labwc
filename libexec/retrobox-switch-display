@@ -13,7 +13,16 @@
 #   internal_output = eDP-1
 #   external_output = HDMI-A-1
 #
-# Usage: retrobox-switch-display [toggle]
+# The resolution is whatever the kernel command line forces, if anything:
+# `video=HDMI-A-1:1280x720@60` in GRUB_CMDLINE_LINUX_DEFAULT makes this
+# output use 1280x720 at 60 Hz here as well (and with no refresh rate, the
+# highest one at that size). Without such a `video=`, the screen's preferred
+# mode is used. Nothing else configures it.
+#
+# Usage: retrobox-switch-display [toggle|mode]
+#   toggle   switch between the internal panel and the external screen
+#   mode     only apply the command line's mode to every connected output
+#            (run by labwc's autostart before retrobox starts)
 set -euo pipefail
 
 SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
@@ -23,10 +32,49 @@ readonly SCRIPT_DIR
 # shellcheck source=libexec/retrobox-labwc-common.sh
 source "${SCRIPT_DIR}/retrobox-labwc-common.sh"
 
-if (($# > 1)) || [[ -n "${1:-}" && "$1" != "toggle" ]]; then
-  echo "usage: $(basename "$0") [toggle]" >&2
+if (($# > 1)) || [[ -n "${1:-}" && "$1" != "toggle" && "$1" != "mode" ]]; then
+  echo "usage: $(basename "$0") [toggle|mode]" >&2
   exit 1
 fi
+
+readonly CMDLINE_FILE="${RETROBOX_CMDLINE_FILE:-/proc/cmdline}"
+
+# Prints the mode (WxH@RHz, or WxH) the kernel command line forces for the
+# output in $1 with video=[CONNECTOR:]WxH[-BPP][@R][flags]; nothing if none
+# does. A video= without a connector applies to every output; the last one
+# that applies wins.
+cmdline_mode() {
+  local output="$1" arg spec conn w h r result=""
+  local -a args
+  read -r -a args <"${CMDLINE_FILE}" || true
+  for arg in "${args[@]}"; do
+    [[ "${arg}" == video=* ]] || continue
+    spec="${arg#video=}"
+    conn="" r=""
+    if [[ "${spec}" =~ ^([A-Za-z0-9_-]+):([0-9]+)x([0-9]+)(-[0-9]+)?(@([0-9]+))? ]]; then
+      conn="${BASH_REMATCH[1]}" w="${BASH_REMATCH[2]}" h="${BASH_REMATCH[3]}" r="${BASH_REMATCH[6]}"
+    elif [[ "${spec}" =~ ^([0-9]+)x([0-9]+)(-[0-9]+)?(@([0-9]+))? ]]; then
+      w="${BASH_REMATCH[1]}" h="${BASH_REMATCH[2]}" r="${BASH_REMATCH[5]}"
+    else
+      continue
+    fi
+    [[ -z "${conn}" || "${conn}" == "${output}" ]] || continue
+    result="${w}x${h}"
+    [[ -z "${r}" ]] || result+="@${r}Hz"
+  done
+  printf '%s' "${result}"
+}
+
+# Turns the output in $1 on, at the command line's mode if there is one.
+turn_on() {
+  local mode
+  mode="$(cmdline_mode "$1")"
+  if [[ -n "${mode}" ]]; then
+    wlr-randr --output "$1" --on --mode "${mode}" --pos 0,0
+  else
+    wlr-randr --output "$1" --on --preferred --pos 0,0
+  fi
+}
 
 output="$(wlr-randr)"
 # Output names: the unindented lines ("HDMI-A-1 "Make Model (HDMI-A-1)"").
@@ -53,17 +101,25 @@ is_enabled() {
 
 use_internal() {
   if connected "${external}"; then wlr-randr --output "${external}" --off; fi
-  wlr-randr --output "${internal}" --on --preferred --pos 0,0
+  turn_on "${internal}"
   "${SCRIPT_DIR}/retrobox-switch-audio-out" internal || true
 }
 
 use_external() {
   if connected "${internal}"; then wlr-randr --output "${internal}" --off; fi
-  wlr-randr --output "${external}" --on --preferred --pos 0,0
+  turn_on "${external}"
   # give the screen time to bring its audio device up
   sleep 3
   "${SCRIPT_DIR}/retrobox-switch-audio-out" external || true
 }
+
+if [[ "${1:-}" == "mode" ]]; then
+  for name in ${names}; do
+    mode="$(cmdline_mode "${name}")"
+    [[ -z "${mode}" ]] || wlr-randr --output "${name}" --mode "${mode}"
+  done
+  exit 0
+fi
 
 if ! connected "${external}"; then
   if connected "${internal}"; then use_internal; fi

@@ -227,4 +227,33 @@ printf '#!/bin/sh\nexit 3\n' >"${WORK}/core/bin/retrobox"
 [[ ! -e "${STUB_STATE}/poweroff" ]] || fail "powered off after a crash"
 pass "on_quit = poweroff powers off after a normal quit, never after a failure"
 
+# --- 10. the resolution is the kernel command line's video=, nothing else -----------------
+RANDR_LOG="${WORK}/randr.log"
+cat >"${STUBS}/wlr-randr" <<SH
+#!/bin/sh
+if [ \$# -eq 0 ]; then
+  printf 'HDMI-A-2 "LG"\\n  Enabled: yes\\n'
+else
+  echo "\$*" >>"${RANDR_LOG}"
+fi
+SH
+chmod +x "${STUBS}/wlr-randr"
+DISPLAY_SH="${ROOT}/libexec/retrobox-switch-display"
+randr_with() { # randr_with CMDLINE ARG: what wlr-randr was asked to do
+  : >"${RANDR_LOG}"
+  printf '%s\n' "$1" >"${WORK}/cmdline"
+  RETROBOX_CMDLINE_FILE="${WORK}/cmdline" "${DISPLAY_SH}" "$2" >/dev/null 2>&1 || true
+  cat "${RANDR_LOG}"
+}
+[[ "$(randr_with 'quiet video=HDMI-A-2:1280x720@60' mode)" == "--output HDMI-A-2 --mode 1280x720@60Hz" ]] || fail "video= not applied"
+[[ -z "$(randr_with 'quiet video=HDMI-A-1:1280x720@60' mode)" ]] || fail "video= of another connector applied"
+[[ -z "$(randr_with 'quiet video=efifb:off' mode)" ]] || fail "a non-mode video= applied"
+[[ "$(randr_with 'video=HDMI-A-2:1280x720' mode)" == "--output HDMI-A-2 --mode 1280x720" ]] || fail "video= without refresh"
+[[ "$(randr_with 'video=1280x720@50 video=HDMI-A-2:1024x768@60e' mode)" == "--output HDMI-A-2 --mode 1024x768@60Hz" ]] || fail "last video= must win, flags ignored"
+[[ "$(randr_with 'video=1280x720-32@50' mode)" == "--output HDMI-A-2 --mode 1280x720@50Hz" ]] || fail "video= without connector"
+[[ "$(randr_with 'quiet video=HDMI-A-2:1280x720@60' toggle)" == "--output HDMI-A-2 --on --mode 1280x720@60Hz --pos 0,0" ]] || fail "toggle ignores video="
+[[ "$(randr_with 'quiet' toggle)" == "--output HDMI-A-2 --on --preferred --pos 0,0" ]] || fail "no video=: preferred mode expected"
+grep -q 'retrobox-switch-display mode' "${HOME}/.config/retrobox-labwc/autostart" || fail "autostart does not apply the mode first"
+pass "the resolution follows video= on the kernel command line, and only that"
+
 echo "All smoke tests passed."
