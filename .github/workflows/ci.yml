@@ -19,7 +19,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck -x -S style install.sh bin/* libexec/* share/login-hook.sh tests/*.sh
+          shellcheck -x -S style install.sh bin/* libexec/* tests/*.sh
 
       - name: Smoke test
         run: tests/smoke-test.sh

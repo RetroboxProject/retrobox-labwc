@@ -85,34 +85,27 @@ grep -q 'pipewire-pulse is not installed' "${WORK}/out" || fail "pipewire-pulse 
 touch "${WORK}/units/pipewire-pulse.service"
 pass "pipewire-pulse needs its systemd unit, not just the command"
 
-# --- 2. the checks of the TTY: read-only, with the way to fix it -------------------------
+# --- 2. the check of the service: read-only, with the way to fix it ------------------------
+UNIT="${RETROBOX_SYSTEMD_DIR}/retrobox-labwc.service"
 expect_fail install_sh --check --tty 8
-grep -q 'tty8 has no autologin' "${WORK}/out" || fail "missing autologin not reported"
-grep -q 'does not boot on tty8' "${WORK}/out" || fail "missing boot not reported"
-grep -q 'retrobox-labwc.conf' "${WORK}/out" && grep -q 'chvt 8' "${WORK}/out" || fail "no hint with the VT switch"
+grep -q 'retrobox-labwc.service is not installed' "${WORK}/out" || fail "missing service not reported"
+grep -q 'Conflicts=getty@tty8.service' "${WORK}/out" && grep -q 'PAMName=login' "${WORK}/out" || fail "no hint with the service"
 [[ -z "$(ls -A "${RETROBOX_SYSTEMD_DIR}")" ]] || fail "--check wrote to the system"
-expect_fail install_sh --check --tty 1
-grep -q 'chvt' "${WORK}/out" && fail "tty1 needs no VT switch"
-mkdir -p "${RETROBOX_SYSTEMD_DIR}/getty@tty2.service.d"
-printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin somebody --noclear %%I $TERM\n' >"${RETROBOX_SYSTEMD_DIR}/getty@tty2.service.d/autologin.conf"
-expect_fail install_sh --check --tty 2
-grep -q "logs 'somebody' in" "${WORK}/out" || fail "other user's autologin not reported"
-expect_fail install_sh --tty 2
-grep -q "already logs 'somebody' in" "${WORK}/out" || fail "install over another user's autologin"
-pass "the TTY checks are read-only; another user's autologin is never overridden"
-
-# --- 3. install (sets the TTY up through sudo) --------------------------------------------
-printf '# my profile\nexport FOO=1' >"${HOME}/.profile" # no trailing newline on purpose
-expect_fail install_sh                                    # no --tty the first time
 expect_fail install_sh --no-system --tty 8
-grep -q 'not set up and --no-system' "${WORK}/out" || fail "--no-system did not refuse"
+grep -q 'service is not set up and --no-system' "${WORK}/out" || fail "--no-system did not refuse"
+pass "the service check is read-only and prints the way to set it up by hand"
+
+# --- 3. install (writes the service through sudo) --------------------------------------------
+printf '# my profile\nexport FOO=1' >"${HOME}/.profile" # no trailing newline on purpose
+expect_fail install_sh # no --tty the first time
 [[ ! -e "${HOME}/.local/share/retrobox-labwc" ]] || fail "--no-system left files behind"
 install_sh --tty 8 >"${WORK}/out" 2>&1 || fail "install failed: $(cat "${WORK}/out")"
-DROPIN="${RETROBOX_SYSTEMD_DIR}/getty@tty8.service.d/retrobox-labwc.conf"
-grep -q -- "--autologin $(id -un)" "${DROPIN}" && grep -q 'ExecStartPre=-.*chvt 8' "${DROPIN}" || fail "drop-in wrong: $(cat "${DROPIN}")"
-[[ -e "${STUB_STATE}/enabled-getty@tty8.service" ]] || fail "getty not enabled at boot"
-install_sh --check --tty 8 >/dev/null 2>&1 || fail "check fails after the install"
 DATA="${HOME}/.local/share/retrobox-labwc"
+grep -q "^User=$(id -un)\$" "${UNIT}" && grep -q '^TTYPath=/dev/tty8$' "${UNIT}" && grep -q '^Conflicts=getty@tty8.service$' "${UNIT}" || fail "unit wrong: $(cat "${UNIT}")"
+grep -q '^Environment=RETROBOX_LABWC_TTY=8$' "${UNIT}" && grep -q "^ExecStart=/bin/bash -lc 'exec ${DATA}/bin/retrobox-labwc-session'\$" "${UNIT}" || fail "unit does not run the session: $(cat "${UNIT}")"
+grep -q '^ExecStopPost=+-.* --no-block start getty@tty8.service$' "${UNIT}" && grep -q '^ExecStartPre=+-.*chvt 8$' "${UNIT}" || fail "unit does not give the tty back: $(cat "${UNIT}")"
+[[ -e "${STUB_STATE}/enabled-retrobox-labwc.service" ]] || fail "service not enabled at boot"
+install_sh --check --tty 8 >/dev/null 2>&1 || fail "check fails after the install"
 [[ -x "${DATA}/install.sh" && -x "${DATA}/bin/retrobox-labwc-session" ]] || fail "tree not copied"
 grep -q 'labwc_tty = 8' "${HOME}/.config/retrobox/retrobox.ini.d/50-labwc.ini" || fail "tty not written"
 grep -q "${DATA}/libexec/retrobox-switch-display" "${HOME}/.config/retrobox-labwc/autostart" || fail "autostart not rendered"
@@ -120,51 +113,41 @@ grep -q "<command>foot</command>" "${HOME}/.config/retrobox-labwc/rc.xml" || fai
 grep -q "${WORK}/core/bin/retrobox-screenshot" "${HOME}/.config/retrobox-labwc/rc.xml" || fail "screenshot not rendered"
 grep -q '@DEFAULT_AUDIO_SINK@' "${HOME}/.config/retrobox-labwc/rc.xml" || fail "wpctl placeholder was clobbered"
 ! grep -q 'go2tty\|exit-tty' "${HOME}/.config/retrobox-labwc/rc.xml" || fail "leftovers in rc.xml"
-[[ "$(grep -c 'retrobox-labwc (managed' "${HOME}/.profile")" == 1 ]] || fail "hook block missing"
-grep -q '^export FOO=1$' "${HOME}/.profile" || fail "profile content damaged"
+[[ "$(cat "${HOME}/.profile")" == $'# my profile\nexport FOO=1' ]] || fail "the profile was touched"
 RULE="${RETROBOX_POLKIT_DIR}/50-retrobox-labwc.rules"
-grep -q "subject.user == \"$(id -un)\"" "${RULE}" && grep -q 'login1.reboot' "${RULE}" && grep -q 'login1.power-off' "${RULE}" || fail "polkit rule wrong"
-pass "install renders everything inside the home directory"
+grep -q "subject.user != \"$(id -un)\"" "${RULE}" && grep -q 'login1.reboot' "${RULE}" && grep -q 'login1.power-off' "${RULE}" || fail "polkit rule wrong"
+grep -q 'manage-units' "${RULE}" && grep -q 'action.lookup("unit") == "retrobox-labwc.service"' "${RULE}" || fail "polkit rule does not cover the service"
+pass "install renders the service and the config; the profile stays untouched"
 
 # --- 4. the TTY is locked once installed -----------------------------------------------
 expect_fail install_sh --tty 2
 grep -q 'already installed on tty8' "${WORK}/out" || fail "tty change not refused: $(cat "${WORK}/out")"
 install_sh --tty 08 >/dev/null 2>&1 || fail "re-install on the same tty refused"
 "${DATA}/install.sh" >/dev/null 2>&1 || fail "re-install without --tty from the installed copy failed"
-[[ "$(grep -c 'retrobox-labwc (managed' "${HOME}/.profile")" == 1 ]] || fail "hook block duplicated"
+grep -q 'system_unit=' "${DATA}/.install-manifest" && grep -q 'polkit_rule=' "${DATA}/.install-manifest" || fail "re-install lost the manifest notes"
 pass "the TTY cannot change without uninstall; re-install is idempotent"
 
-# --- 5. uninstall leaves the profile as it was -------------------------------------------
+# --- 5. uninstall undoes the system part and leaves the profile as it was ------------------
 "${DATA}/install.sh" --uninstall >/dev/null 2>&1 || fail "uninstall failed"
 [[ ! -e "${DATA}" && ! -e "${HOME}/.config/retrobox-labwc" && ! -e "${HOME}/.config/retrobox/retrobox.ini.d/50-labwc.ini" ]] || fail "files left"
 [[ "$(cat "${HOME}/.profile")" == $'# my profile\nexport FOO=1' ]] || fail "profile not restored: $(cat "${HOME}/.profile")"
-[[ ! -e "${DROPIN}" && ! -e "${STUB_STATE}/enabled-getty@tty8.service" ]] || fail "system part not undone"
+[[ ! -e "${UNIT}" && ! -e "${STUB_STATE}/enabled-retrobox-labwc.service" ]] || fail "service not removed"
 [[ ! -e "${RULE}" ]] || fail "polkit rule not removed"
-[[ -e "${RETROBOX_SYSTEMD_DIR}/getty@tty2.service.d/autologin.conf" ]] || fail "uninstall touched a drop-in that is not ours"
-pass "uninstall restores the profile and undoes the system part"
+pass "uninstall removes the service and the rule, and restores the profile"
 
-# --- 5b. tty1 needs no VT switch; an autologin of yours is kept and only completed ---------
-install_sh --tty 1 >/dev/null 2>&1 || fail "install on tty1 failed"
-D1="${RETROBOX_SYSTEMD_DIR}/getty@tty1.service.d/retrobox-labwc.conf"
-grep -q -- '--autologin' "${D1}" && ! grep -q chvt "${D1}" || fail "tty1 drop-in wrong: $(cat "${D1}")"
-[[ ! -e "${STUB_STATE}/enabled-getty@tty1.service" ]] || fail "tty1 getty enabled needlessly"
+# --- 5b. an install of the previous version (login hook + autologin drop-in) is migrated ---
+OLD="${RETROBOX_SYSTEMD_DIR}/getty@tty8.service.d/retrobox-labwc.conf"
+mkdir -p "$(dirname "${OLD}")" "${HOME}/.local/share/retrobox-labwc"
+printf '# Written by retrobox-labwc: old\n[Service]\nExecStart=\n' >"${OLD}"
+touch "${STUB_STATE}/enabled-getty@tty8.service"
+printf 'tty=8\nuser=%s\nsystem_dropin=%s\ngetty_enabled=1\n' "$(id -un)" "${OLD}" >"${HOME}/.local/share/retrobox-labwc/.install-manifest"
+printf '# my profile\n# >>> retrobox-labwc (managed by its install.sh; removed by --uninstall) >>>\n. hook\n# <<< retrobox-labwc <<<\n' >"${HOME}/.profile"
+install_sh >/dev/null 2>&1 || fail "migration install failed"
+[[ ! -e "${OLD}" && ! -e "${STUB_STATE}/enabled-getty@tty8.service" ]] || fail "old autologin drop-in left"
+! grep -q 'retrobox-labwc' "${HOME}/.profile" && grep -q '^# my profile$' "${HOME}/.profile" || fail "old login hook left: $(cat "${HOME}/.profile")"
+[[ -f "${UNIT}" ]] && ! grep -q 'system_dropin' "${HOME}/.local/share/retrobox-labwc/.install-manifest" || fail "migration did not switch to the service"
 "${HOME}/.local/share/retrobox-labwc/install.sh" --uninstall >/dev/null 2>&1
-mkdir -p "${RETROBOX_SYSTEMD_DIR}/getty@tty3.service.d"
-printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin %s --noclear %%I $TERM\n' "$(id -un)" >"${RETROBOX_SYSTEMD_DIR}/getty@tty3.service.d/autologin.conf"
-install_sh --tty 3 >/dev/null 2>&1 || fail "install on a tty with your own autologin failed"
-D3="${RETROBOX_SYSTEMD_DIR}/getty@tty3.service.d/retrobox-labwc.conf"
-grep -q 'chvt 3' "${D3}" && ! grep -q -- '--autologin' "${D3}" || fail "own autologin overridden: $(cat "${D3}")"
-"${HOME}/.local/share/retrobox-labwc/install.sh" --uninstall >/dev/null 2>&1
-[[ -e "${RETROBOX_SYSTEMD_DIR}/getty@tty3.service.d/autologin.conf" && ! -e "${D3}" ]] || fail "uninstall on tty3 wrong"
-pass "tty1 gets no VT switch; your own autologin is kept and only completed"
-
-# --- 6. a profile that does not exist yet is created, and removed again --------------------
-rm -f "${HOME}/.profile"
-printf 'echo rc\n' >"${HOME}/.bashrc"
-install_sh --tty 8 >/dev/null 2>&1
-grep -q '\. ~/.bashrc' "${HOME}/.bash_profile" || fail ".bash_profile does not read .bashrc"
-"${HOME}/.local/share/retrobox-labwc/install.sh" --uninstall >/dev/null 2>&1
-pass "a new ~/.bash_profile keeps reading ~/.bashrc"
+pass "an install with the login hook and the autologin drop-in is migrated to the service"
 
 # --- 7. keyboard: read from the system, at every start -----------------------------------
 # shellcheck source=libexec/retrobox-labwc-common.sh

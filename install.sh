@@ -1,36 +1,36 @@
 #!/usr/bin/env bash
-# retrobox-labwc: user-level installer of the labwc gaming session for
-# minimal systems (Debian netinstall, Arch, ...). It needs no root and
-# installs no packages: it CHECKS that what the session needs is there and
-# sets up everything else inside your home.
+# retrobox-labwc: installer of the labwc gaming session for minimal systems
+# (Debian netinstall, Arch, ...). It installs no packages: it CHECKS that
+# what the session needs is there and sets up the rest.
+#
+# The session runs as a systemd service (retrobox-labwc.service) that owns
+# the gaming TTY and logs your user in on it, so there is no autologin and
+# no login hook. You manage it like any service:
+#   systemctl stop retrobox-labwc     bare system: the TTY gets its login prompt
+#   systemctl start retrobox-labwc    the gaming session again
+#   systemctl restart retrobox-labwc  start it over (e.g. after a keyboard change)
 #
 # It checks:
 #   * labwc, pipewire-pulse and a terminal (foot or alacritty) are installed
 #     (also dbus-run-session, which the session needs; the rest is advice)
-#   * the gaming TTY logs your user in by itself (systemd getty autologin)
-#     and the machine boots on it
 #
-# If the TTY does not log in by itself yet, or the machine does not boot on
-# it, the installer sets that up (the only thing that needs root: it asks
-# for your password through sudo): a drop-in
-# /etc/systemd/system/getty@ttyN.service.d/retrobox-labwc.conf with the
-# autologin and, for any TTY but 1, a VT switch to it at boot, and the getty
-# enabled at boot. It also writes a polkit rule (50-retrobox-labwc.rules) that
-# lets your user power off and reboot from any session, so the systemctl
-# reboot/poweroff sent by EmulationStation always work. Pass --no-system to
-# leave the system alone, or --no-polkit to skip just that rule.
+# The service and a polkit rule are the only things that need root (it asks
+# for your password through sudo): /etc/systemd/system/retrobox-labwc.service,
+# enabled at boot, and /etc/polkit-1/rules.d/50-retrobox-labwc.rules, which
+# lets your user start and stop that service, power off and reboot from any
+# session (so ssh and the systemctl reboot/poweroff sent by EmulationStation
+# need no password). Pass --no-system to leave /etc alone, or --no-polkit to
+# skip just the rule.
 #
 # It sets up, in your home only:
 #   * ~/.local/share/retrobox-labwc    this tree (so the checkout can go)
 #   * ~/.config/retrobox-labwc         labwc's config for the session
 #   * ~/.config/retrobox/retrobox.ini.d/50-labwc.ini   the gaming TTY
-#   * a block in your login profile (~/.bash_profile, ~/.bash_login or
-#     ~/.profile) that starts the session on the gaming TTY
 #
 # The keyboard is always the system's (/etc/default/keyboard on Debian,
 # localectl elsewhere), read every time the session starts. After changing
 # it (Debian: sudo dpkg-reconfigure keyboard-configuration) press
-# Win+Shift+R in the session, or log in again.
+# Win+Shift+R in the session, or restart the service.
 #
 # Once installed, the TTY cannot be changed: uninstall first, then install.
 #
@@ -39,13 +39,14 @@
 #        ./install.sh --uninstall
 #   --tty N       gaming TTY (1-12); required the first time
 #   --on-quit X   what happens when Retrobox quits normally (exit status 0):
-#                 poweroff (the default the first time) or shell (stay at the
-#                 prompt); a re-run keeps the current choice unless given
+#                 poweroff (the default the first time) or shell (the service
+#                 ends and the TTY gets its login prompt); a re-run keeps the
+#                 current choice unless given
 #   --check       only run the checks, change nothing
-#   --no-system   never touch /etc (no sudo): a missing autologin is an error
-#   --no-polkit   do not write the polkit rule for power off and reboot
+#   --no-system   never touch /etc (no sudo): a missing service is an error
+#   --no-polkit   do not write the polkit rule
 #   --force       install even if a check fails
-#   --uninstall   remove everything this script set up, /etc drop-in included
+#   --uninstall   remove everything this script set up, /etc files included
 #   -h, --help
 set -euo pipefail
 
@@ -209,118 +210,131 @@ print_install_hint() {
   ((${#rec[@]} == 0)) || info "Recommended: ${cmd} ${rec[*]}"
 }
 
-# autologin_user TTY: prints the user getty@ttyTTY logs in by itself and
-# returns 0, 1 if it asks for a login, 2 if this cannot be told (no systemd).
-autologin_user() {
-  local unit="getty@tty$1.service" exec_line user
-  have systemctl || return 2
-  # the merged unit, drop-ins included; the last ExecStart= is the one in force
-  exec_line="$(systemctl cat "${unit}" 2>/dev/null | grep -E '^ExecStart=.' | tail -n1)" || return 2
-  user="$(sed -n -E 's/.*[[:space:]](--autologin[=[:space:]]|-a[[:space:]])[[:space:]]*([^[:space:]]+).*/\2/p' <<<"${exec_line}")"
-  [[ -n "${user}" ]] || return 1
-  printf '%s\n' "${user}"
+UNIT_NAME="retrobox-labwc.service"
+readonly UNIT_NAME
+
+unit_path() {
+  printf '%s/%s\n' "${SYSTEMD_DIR}" "${UNIT_NAME}"
 }
 
-# True if the machine boots on TTY: tty1 always does; any other needs its
-# getty enabled at boot and a VT switch to it.
-boots_on_tty() {
-  local tty="$1"
-  ((tty == 1)) && return 0
-  have systemctl || return 1
-  systemctl is-enabled --quiet "getty@tty${tty}.service" 2>/dev/null || return 1
-  systemctl cat "getty@tty${tty}.service" 2>/dev/null | grep -qE "^ExecStartPre=.*chvt[[:space:]]+${tty}([[:space:]]|\$)"
-}
-
-# What the system part needs; set by check_system_tty.
-NEED_AUTOLOGIN=0
-NEED_BOOT=0
-OTHER_USER=""
-
-check_system_tty() {
-  local tty="$1" user rc=0
-  NEED_AUTOLOGIN=0 NEED_BOOT=0 OTHER_USER=""
-
-  user="$(autologin_user "${tty}")" || rc=$?
-  case "${rc}" in
-  0)
-    if [[ "${user}" == "${USER_NAME}" ]]; then
-      ok "tty${tty} logs ${USER_NAME} in by itself"
-    else
-      bad "tty${tty} logs '${user}' in by itself, not ${USER_NAME}"
-      OTHER_USER="${user}"
-    fi
-    ;;
-  1)
-    bad "tty${tty} has no autologin"
-    NEED_AUTOLOGIN=1
-    ;;
-  *)
-    bad "cannot tell if tty${tty} has autologin: this needs a running systemd"
-    FAILED=1
-    return 0
-    ;;
-  esac
-
-  if boots_on_tty "${tty}"; then
-    ok "the machine boots on tty${tty}"
-  else
-    bad "the machine does not boot on tty${tty}"
-    NEED_BOOT=1
-  fi
-}
-
-# dropin_content TTY: the getty drop-in for what is needed (NEED_*).
-dropin_content() {
-  local tty="$1" agetty chvt
-  agetty="$(PATH="${PATH}:/usr/sbin:/sbin" command -v agetty || true)"
-  agetty="${agetty:-/sbin/agetty}"
+# unit_content TTY: the service. It takes TTY over from its getty (Conflicts=),
+# logs USER_NAME in through PAM (a real logind session on the seat, which is
+# what labwc needs) and runs the session from a login shell, so your PATH is
+# the one of your profile. When it ends, however it ends, the getty comes back.
+unit_content() {
+  local tty="$1" chvt systemctl_bin
   chvt="$(PATH="${PATH}:/usr/sbin:/sbin" command -v chvt || true)"
   chvt="${chvt:-/usr/bin/chvt}"
-  printf '# Written %s: the labwc gaming session starts from this login.\n[Service]\n' "${GENERATED_MARK}"
-  if ((NEED_AUTOLOGIN == 1)); then
-    # shellcheck disable=SC2016  # $TERM is for agetty/systemd, not for us
-    printf 'ExecStart=\nExecStart=-%s --autologin %s --noclear %%I $TERM\n' "${agetty}" "${USER_NAME}"
-  fi
-  if ((NEED_BOOT == 1)); then
-    printf 'ExecStartPre=-%s %s\n' "${chvt}" "${tty}"
-  fi
+  systemctl_bin="$(command -v systemctl || true)"
+  systemctl_bin="${systemctl_bin:-/usr/bin/systemctl}"
+  cat <<UNIT
+# Written ${GENERATED_MARK}: the labwc gaming session of ${USER_NAME} on tty${tty}.
+# systemctl stop ${UNIT_NAME} gives tty${tty} its login prompt back.
+[Unit]
+Description=Retrobox labwc gaming session (tty${tty})
+After=systemd-user-sessions.service plymouth-quit-wait.service systemd-logind.service getty@tty${tty}.service
+Conflicts=getty@tty${tty}.service
+
+[Service]
+Type=simple
+User=${USER_NAME}
+PAMName=login
+TTYPath=/dev/tty${tty}
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardInput=tty-fail
+StandardOutput=journal
+StandardError=journal
+UtmpIdentifier=tty${tty}
+UtmpMode=user
+Environment=RETROBOX_LABWC_TTY=${tty}
+ExecStartPre=+-${chvt} ${tty}
+ExecStart=/bin/bash -lc 'exec ${DATA_DIR}/bin/retrobox-labwc-session'
+ExecStopPost=+-${systemctl_bin} --no-block start getty@tty${tty}.service
+Restart=no
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
+UNIT
 }
 
-dropin_path() {
-  printf '%s/getty@tty%s.service.d/retrobox-labwc.conf\n' "${SYSTEMD_DIR}" "$1"
-}
+# What the system part needs; set by check_service.
+NEED_SERVICE=0
 
-print_system_hint() {
+check_service() {
   local tty="$1" file
-  file="$(dropin_path "${tty}")"
-  info "install.sh sets this up for you (with sudo); by hand it is:"
-  echo "  sudo mkdir -p $(dirname -- "${file}")"
-  echo "  sudo tee ${file} >/dev/null <<'CONF'"
-  dropin_content "${tty}"
-  echo "CONF"
-  ((tty == 1)) || echo "  sudo systemctl enable getty@tty${tty}.service"
-  echo "  sudo systemctl daemon-reload"
+  NEED_SERVICE=0
+  file="$(unit_path)"
+  if [[ ! -f "${file}" ]]; then
+    bad "the service ${UNIT_NAME} is not installed"
+    NEED_SERVICE=1
+  elif [[ "$(cat -- "${file}")" != "$(unit_content "${tty}")" ]]; then
+    bad "the service ${UNIT_NAME} is not up to date"
+    NEED_SERVICE=1
+  else
+    ok "the service ${UNIT_NAME} is in place (tty${tty})"
+  fi
 }
 
-# Makes TTY log in by itself and the machine boot on it. Records what it
-# did in SYSTEM_NOTES for the manifest (so --uninstall can undo exactly it).
+print_service_hint() {
+  local tty="$1" file
+  file="$(unit_path)"
+  info "install.sh sets this up for you (with sudo); by hand it is:"
+  echo "  sudo tee ${file} >/dev/null <<'UNIT'"
+  unit_content "${tty}"
+  echo "UNIT"
+  echo "  sudo systemctl daemon-reload"
+  echo "  sudo systemctl enable ${UNIT_NAME}"
+}
+
+# Writes the service and enables it at boot. Records what it did in
+# SYSTEM_NOTES for the manifest (so --uninstall can undo exactly it).
 SYSTEM_NOTES=""
 PREV_NOTES=""
-install_system() {
+install_service() {
   local tty="$1" file tmp
-  file="$(dropin_path "${tty}")"
-  have sudo || die "sudo is needed to set up tty${tty} (or do it yourself and use --no-system)"
-  info "Setting up tty${tty} (sudo): ${file}"
-  tmp="$(mktemp)"
-  dropin_content "${tty}" >"${tmp}"
-  sudo install -d -m 0755 -- "$(dirname -- "${file}")" || die "sudo failed"
-  sudo install -m 0644 -- "${tmp}" "${file}" || die "sudo failed"
-  rm -f -- "${tmp}"
-  SYSTEM_NOTES="system_dropin=${file}"$'\n'
-  if ((tty != 1)) && ! systemctl is-enabled --quiet "getty@tty${tty}.service" 2>/dev/null; then
-    sudo systemctl enable "getty@tty${tty}.service" >/dev/null 2>&1 || die "could not enable getty@tty${tty}"
-    SYSTEM_NOTES+="getty_enabled=1"$'\n'
+  file="$(unit_path)"
+  have sudo || die "sudo is needed for the service (or do it yourself and use --no-system)"
+  if ((NEED_SERVICE == 1)); then
+    info "Writing the service (sudo): ${file}"
+    tmp="$(mktemp)"
+    unit_content "${tty}" >"${tmp}"
+    sudo install -d -m 0755 -- "${SYSTEMD_DIR}" || die "sudo failed"
+    sudo install -m 0644 -- "${tmp}" "${file}" || die "sudo failed"
+    rm -f -- "${tmp}"
+    sudo systemctl daemon-reload
   fi
+  if ! systemctl is-enabled --quiet "${UNIT_NAME}" 2>/dev/null; then
+    sudo systemctl enable "${UNIT_NAME}" >/dev/null 2>&1 || die "could not enable ${UNIT_NAME}"
+  fi
+  SYSTEM_NOTES+="system_unit=${file}"$'\n'
+}
+
+# manifest_get KEY: the value recorded in the manifest, if any.
+manifest_get() {
+  [[ -f "${MANIFEST}" ]] || return 0
+  sed -n "s/^$1=//p" "${MANIFEST}" | head -n1
+}
+
+# What an earlier version of this installer left: an autologin drop-in on the
+# getty (the session started from a login hook). The service replaces it.
+remove_old_dropin() {
+  local dropin enabled tty
+  dropin="$(manifest_get system_dropin)"
+  enabled="$(manifest_get getty_enabled)"
+  tty="$(installed_tty || true)"
+  [[ -n "${dropin}" ]] || return 0
+  if ((SYSTEM == 0)) || ! have sudo; then
+    warn "Left in the system (remove as root): ${dropin}"
+    [[ -z "${enabled}" ]] || warn "  and: systemctl disable getty@tty${tty}.service"
+    return 0
+  fi
+  info "Removing the autologin drop-in of the previous install (sudo): ${dropin}"
+  grep -qsF "${GENERATED_MARK}" "${dropin}" && sudo rm -f -- "${dropin}"
+  sudo rmdir --ignore-fail-on-non-empty -- "$(dirname -- "${dropin}")" 2>/dev/null || true
+  [[ -z "${enabled}" ]] || sudo systemctl disable "getty@tty${tty}.service" >/dev/null 2>&1 || true
   sudo systemctl daemon-reload
 }
 
@@ -328,7 +342,10 @@ install_system() {
 # run recorded (a re-run that finds everything in place adds nothing).
 merge_notes() {
   local key line
-  for key in system_dropin getty_enabled polkit_rule; do
+  local -a keys=(system_unit polkit_rule)
+  # an old autologin drop-in that could not be removed (--no-system) stays on record
+  ((SYSTEM == 1)) || keys+=(system_dropin getty_enabled)
+  for key in "${keys[@]}"; do
     grep -q "^${key}=" <<<"${SYSTEM_NOTES}" && continue
     line="$(grep "^${key}=" <<<"${PREV_NOTES}" || true)"
     [[ -z "${line}" ]] || SYSTEM_NOTES+="${line}"$'\n'
@@ -342,18 +359,26 @@ polkit_rule_path() {
 polkit_rule_content() {
   cat <<RULE
 // Written ${GENERATED_MARK}: ${USER_NAME} may power off and reboot from any
-// session (EmulationStation sends systemctl poweroff and reboot).
+// session (EmulationStation sends systemctl poweroff and reboot) and start,
+// stop and restart ${UNIT_NAME} (ssh included).
 polkit.addRule(function(action, subject) {
-  if (subject.user == "${USER_NAME}" &&
-      (action.id.indexOf("org.freedesktop.login1.power-off") == 0 ||
-       action.id.indexOf("org.freedesktop.login1.reboot") == 0)) {
+  if (subject.user != "${USER_NAME}") {
+    return polkit.Result.NOT_HANDLED;
+  }
+  if (action.id.indexOf("org.freedesktop.login1.power-off") == 0 ||
+      action.id.indexOf("org.freedesktop.login1.reboot") == 0) {
     return polkit.Result.YES;
   }
+  if (action.id == "org.freedesktop.systemd1.manage-units" &&
+      action.lookup("unit") == "${UNIT_NAME}") {
+    return polkit.Result.YES;
+  }
+  return polkit.Result.NOT_HANDLED;
 });
 RULE
 }
 
-# Lets the user power off and reboot without a password from any session.
+# Lets the user power off, reboot and manage the service without a password.
 install_polkit_rule() {
   local file tmp
   file="$(polkit_rule_path)"
@@ -473,19 +498,6 @@ write_tty_setting() {
   printf '# Written %s.\n[advanced]\nlabwc_tty = %s\n' "${GENERATED_MARK}" "${TTY}" >"${TTY_DROPIN}"
 }
 
-# The profile bash reads for a login shell: the first of PROFILES that
-# exists, or a new ~/.bash_profile.
-login_profile() {
-  local name
-  for name in "${PROFILES[@]}"; do
-    [[ -f "${HOME}/${name}" ]] && {
-      printf '%s\n' "${HOME}/${name}"
-      return 0
-    }
-  done
-  printf '%s\n' "${HOME}/.bash_profile"
-}
-
 # Deletes our block from a profile (if it is there). Written back with cat so
 # a symlinked profile (dotfile managers) stays a symlink.
 remove_block() {
@@ -501,30 +513,17 @@ remove_block() {
   rm -f -- "${tmp}"
 }
 
-install_login_hook() {
-  local profile name
-  profile="$(login_profile)"
-  info "Adding the session hook to ${profile}..."
-  for name in "${PROFILES[@]}"; do remove_block "${HOME}/${name}"; done
-  if [[ ! -e "${profile}" ]]; then
-    # bash skips ~/.bashrc in a login shell unless the profile reads it
-    printf '%s\n' '[ -r ~/.bashrc ] && . ~/.bashrc' >"${profile}"
-  fi
-  [[ -s "${profile}" && -n "$(tail -c1 "${profile}")" ]] && echo >>"${profile}"
-  {
-    echo "${BLOCK_BEGIN}"
-    echo "[ -n \"\${BASH_VERSION:-}\" ] && [ -r '${DATA_DIR}/share/login-hook.sh' ] && . '${DATA_DIR}/share/login-hook.sh'"
-    echo "${BLOCK_END}"
-  } >>"${profile}"
-  if [[ "$(getent passwd "${USER_NAME}" | cut -d: -f7)" != */bash ]]; then
-    warn "your login shell is not bash: the hook only works from bash (chsh -s /bin/bash)"
-  fi
-}
-
 # What the old packages' retrobox-labwc-setup left in the home directory:
 # its hook would start a second session from the old install.
 remove_legacy() {
-  local hook="${HOME}/.bashrc.d/64_retrobox"
+  local hook="${HOME}/.bashrc.d/64_retrobox" name
+  # the login hook of the previous version: the service replaces it
+  for name in "${PROFILES[@]}"; do
+    if grep -qsF "${BLOCK_BEGIN}" "${HOME}/${name}"; then
+      info "Removing the old session hook from ~/${name} (the service replaces it)..."
+      remove_block "${HOME}/${name}"
+    fi
+  done
   if grep -qsF "retrobox-labwc-setup" "${hook}"; then
     info "Removing the old session hook ${hook}..."
     rm -f -- "${hook}"
@@ -542,7 +541,7 @@ do_install() {
   local prev
 
   # what an earlier run did to the system, kept when this one has nothing to add
-  PREV_NOTES="$(grep -E '^(system_dropin|getty_enabled|polkit_rule)=' "${MANIFEST}" 2>/dev/null || true)"
+  PREV_NOTES="$(grep -E '^(system_unit|polkit_rule|system_dropin|getty_enabled)=' "${MANIFEST}" 2>/dev/null || true)"
   if prev="$(installed_tty)"; then
     if [[ -n "${TTY_ARG}" ]] && ((10#${TTY_ARG} != 10#${prev})); then
       die "already installed on tty${prev}: run ./install.sh --uninstall before using tty${TTY_ARG}"
@@ -556,21 +555,21 @@ do_install() {
 
   info "Checking the system for tty${TTY}..."
   check_dependencies "${TTY}"
-  check_system_tty "${TTY}"
+  check_service "${TTY}"
   report_keyboard
-  [[ -z "${OTHER_USER}" ]] || die "tty${TTY} already logs '${OTHER_USER}' in: pick another tty, or change it yourself"
   if ((FAILED == 1)); then
     ((FORCE == 1)) || die "fix what is marked [MISS] above and run it again (or use --force)"
     warn "Installing anyway (--force)."
   fi
-  if ((NEED_AUTOLOGIN + NEED_BOOT > 0)); then
-    if ((SYSTEM == 1)); then
-      install_system "${TTY}"
-    elif ((FORCE == 1)); then
-      warn "tty${TTY} is not set up (--no-system): the session will not start by itself."
+  if ((SYSTEM == 1)); then
+    remove_old_dropin
+    install_service "${TTY}"
+  elif ((NEED_SERVICE == 1)); then
+    if ((FORCE == 1)); then
+      warn "The service is not set up (--no-system): the session will not start by itself."
     else
-      print_system_hint "${TTY}"
-      die "tty${TTY} is not set up and --no-system was given (or use --force)"
+      print_service_hint "${TTY}"
+      die "the service is not set up and --no-system was given (or use --force)"
     fi
   fi
 
@@ -585,7 +584,6 @@ do_install() {
   write_labwc_config
   write_on_quit
   write_tty_setting
-  install_login_hook
   remove_legacy
 
   mkdir -p -- "${BIN_DIR}"
@@ -594,36 +592,39 @@ do_install() {
 
   merge_notes
   printf 'tty=%s\nuser=%s\ndate=%s\n%s' "${TTY}" "${USER_NAME}" "$(date -Iseconds)" "${SYSTEM_NOTES}" >"${MANIFEST}"
-  ok "Installed. Log in on tty${TTY} (or reboot) to start the session."
+  ok "Installed. The session starts at boot on tty${TTY}."
+  info "Start it now: systemctl start ${UNIT_NAME}   (sudo if --no-polkit; stop gives the tty its login prompt)"
+  if systemctl is-active --quiet "${UNIT_NAME}" 2>/dev/null; then
+    info "The session is running with the files it started with: systemctl restart ${UNIT_NAME} to use the new ones."
+  fi
   info "Remove it with: ${DATA_DIR}/install.sh --uninstall"
 }
 
 # ------------------------------------------------------------- uninstall
-# Undoes what install_system and install_polkit_rule recorded in the manifest.
+# Undoes what install_service and install_polkit_rule recorded in the manifest.
 uninstall_system() {
-  local dropin enabled rule tty
-  dropin="$(sed -n 's/^system_dropin=//p' "${MANIFEST}" 2>/dev/null | head -n1)"
-  enabled="$(sed -n 's/^getty_enabled=//p' "${MANIFEST}" 2>/dev/null | head -n1)"
-  rule="$(sed -n 's/^polkit_rule=//p' "${MANIFEST}" 2>/dev/null | head -n1)"
-  tty="$(installed_tty || true)"
-  [[ -n "${dropin}${rule}" ]] || return 1
+  local unit rule dropin
+  unit="$(manifest_get system_unit)"
+  rule="$(manifest_get polkit_rule)"
+  dropin="$(manifest_get system_dropin)"
+  [[ -n "${unit}${rule}${dropin}" ]] || return 1
   if ((SYSTEM == 0)) || ! have sudo; then
-    [[ -z "${dropin}" ]] || warn "Left in the system (remove as root): ${dropin}"
-    [[ -z "${enabled}" ]] || warn "  and: systemctl disable getty@tty${tty}.service"
+    [[ -z "${unit}" ]] || warn "Left in the system (remove as root): ${unit} (and: systemctl disable ${UNIT_NAME})"
     [[ -z "${rule}" ]] || warn "Left in the system (remove as root): ${rule}"
+    remove_old_dropin
     return 0
   fi
   if [[ -n "${rule}" ]]; then
     info "Removing ${rule} (sudo)..."
     grep -qsF "${GENERATED_MARK}" "${rule}" && sudo rm -f -- "${rule}"
   fi
-  if [[ -n "${dropin}" ]]; then
-    info "Removing ${dropin} (sudo)..."
-    grep -qsF "${GENERATED_MARK}" "${dropin}" && sudo rm -f -- "${dropin}"
-    sudo rmdir --ignore-fail-on-non-empty -- "$(dirname -- "${dropin}")" 2>/dev/null || true
-    [[ -z "${enabled}" ]] || sudo systemctl disable "getty@tty${tty}.service" >/dev/null 2>&1 || true
+  if [[ -n "${unit}" ]]; then
+    info "Removing ${unit} (sudo)..."
+    sudo systemctl disable "${UNIT_NAME}" >/dev/null 2>&1 || true
+    grep -qsF "${GENERATED_MARK}" "${unit}" && sudo rm -f -- "${unit}"
     sudo systemctl daemon-reload
   fi
+  remove_old_dropin
 }
 
 do_uninstall() {
@@ -664,7 +665,7 @@ do_uninstall() {
   if ((found == 0)); then
     info "Nothing to remove."
   else
-    ok "Removed. An autologin you set up yourself (not by this script) is left alone."
+    ok "Removed. If the session is still running: systemctl stop ${UNIT_NAME} (or reboot) gives the tty its login prompt back."
   fi
 }
 
@@ -730,12 +731,11 @@ if ((CHECK_ONLY == 1)); then
   if [[ -n "${TTY_ARG}" ]]; then TTY="$((10#${TTY_ARG}))"; fi
   [[ -n "${TTY}" ]] || die "which TTY? use --check --tty N"
   check_dependencies "${TTY}"
-  check_system_tty "${TTY}"
+  check_service "${TTY}"
   report_keyboard
-  [[ -z "${OTHER_USER}" ]] || FAILED=1
-  if ((NEED_AUTOLOGIN + NEED_BOOT > 0)); then
+  if ((NEED_SERVICE == 1)); then
     FAILED=1
-    print_system_hint "${TTY}"
+    print_service_hint "${TTY}"
   fi
   exit "${FAILED}"
 fi

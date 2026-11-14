@@ -121,13 +121,13 @@ is_valid_tty() {
   [[ "${1:-}" =~ ^[0-9]+$ ]] && ((10#${1} >= 1 && 10#${1} <= 12))
 }
 
-# Prints the configured gaming TTY (retrobox.ini, [advanced] labwc_tty).
-# Returns 1 with a message on stderr if it is missing or out of range;
-# callers decide what to do (scripts exit, the login hook just gives up).
+# Prints the gaming TTY: RETROBOX_LABWC_TTY (set by the systemd service),
+# else retrobox.ini, [advanced] labwc_tty.
+# Returns 1 with a message on stderr if it is missing or out of range.
 get_gaming_tty() {
-  local tty
+  local tty="${RETROBOX_LABWC_TTY:-}"
 
-  tty="$(get_retrobox_setting advanced labwc_tty)" || {
+  [[ -n "${tty}" ]] || tty="$(get_retrobox_setting advanced labwc_tty)" || {
     echo "error: missing [advanced] labwc_tty in retrobox.ini" \
       "(~/.config/retrobox/retrobox.ini or /etc/retrobox/retrobox.ini)" >&2
     return 1

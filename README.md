@@ -1,14 +1,22 @@
 # retrobox-labwc
 
-The labwc gaming session of [Retrobox](https://github.com/RetroboxProject/retrobox-core), for **minimal systems** (Debian netinstall, Arch, ...): the machine logs in on a TTY by itself, starts [labwc](https://labwc.github.io) there and Retrobox runs inside it. No desktop, no display manager.
+The labwc gaming session of [Retrobox](https://github.com/RetroboxProject/retrobox-core), for **minimal systems** (Debian netinstall, Arch, ...): the machine boots on a TTY, where a systemd service starts [labwc](https://labwc.github.io) and Retrobox runs inside it. No desktop, no display manager, no autologin.
 
-It is a single user-level installer: no root, no packages. It checks what the system must already have and sets up the rest inside your home.
+It is a single installer: it installs no packages, it checks what the system must already have and sets up the rest (your home, plus one service and one polkit rule through `sudo`).
+
+The session is an ordinary service, so you can manage it from anywhere, ssh included:
+
+```bash
+systemctl stop retrobox-labwc      # bare system: the TTY gets its login prompt back
+systemctl start retrobox-labwc     # the gaming session again
+systemctl restart retrobox-labwc   # start over (e.g. after a keyboard change)
+```
 
 - **Win+P** switches the display output (internal panel ⇄ external screen).
 - **Win+Shift+R** restarts the session (it re-reads the system keyboard), **Win+Shift+E** exits labwc and ends it.
 - The mouse pointer is parked in the bottom-right corner when the session starts (see [Mouse pointer](#mouse-pointer)). The volume keys (capped at 100%, no distorted boost), **Print** (Retrobox screenshot), **Alt+Tab**, **Alt+F4** and **Win+T** (terminal) work as usual.
 
-Retrobox ending closes labwc, and you are left at the shell prompt of that TTY (log out for a fresh autologin).
+Retrobox ending closes labwc; unless the machine is set to power off, the service ends and the TTY shows its login prompt.
 
 ## Requirements
 
@@ -22,7 +30,7 @@ Installed by you, with your package manager (`./install.sh --check --tty N` tell
 | dbus-run-session | `dbus-bin` | `dbus` |
 | recommended | `wlr-randr wireplumber xwayland wlrctl` | `wlr-randr wireplumber xorg-xwayland wlrctl` |
 
-plus `retrobox-core` and systemd. For any TTY but 1, `chvt` (package `kbd`) is needed too.
+plus `retrobox-core`, systemd and PAM (`libpam-systemd` on Debian). For any TTY but 1, `chvt` (package `kbd`) is needed too.
 
 ## Install
 
@@ -31,18 +39,17 @@ git clone https://github.com/RetroboxProject/retrobox-labwc && cd retrobox-labwc
 ./install.sh --tty 1        # --check --tty 1 only checks; --force installs even if a check fails
 ```
 
-The machine should log in on the gaming TTY by itself and boot on it. If that is not so yet, the installer sets it up, and this is the only thing that needs root (it asks for your password through `sudo`; `--no-system` skips it, plus the polkit rule below): a drop-in `/etc/systemd/system/getty@ttyN.service.d/retrobox-labwc.conf` with the getty autologin and, for any TTY but 1, a switch to it at boot (`chvt N`), plus `systemctl enable getty@ttyN`. An autologin you already have on that TTY is kept and only completed; one for another user is never overridden. `./install.sh --check` prints what it would write.
+The installer needs root for two files only (it asks for your password through `sudo`; `--no-system` skips both): `/etc/systemd/system/retrobox-labwc.service`, enabled at boot, and the polkit rule below (`--no-polkit` skips just the rule). The service takes the gaming TTY over from its getty (`Conflicts=getty@ttyN`), logs your user in through PAM (a real logind session, which labwc needs), switches to that VT (`chvt N`) and runs the session from a login shell, so your `PATH` is the one of your profile. When it ends, however it ends, the getty comes back. `./install.sh --check` prints the unit it would write.
 
 Everything lands in your home:
 
 - `~/.local/share/retrobox-labwc`: a copy of this tree (the checkout can go) and `retrobox-labwc-session` linked in `~/.local/bin`
 - `~/.config/retrobox-labwc`: labwc's config for the session (`labwc -C`); your `~/.config/labwc` is never touched
 - `~/.config/retrobox/retrobox.ini.d/50-labwc.ini`: `[advanced] labwc_tty`
-- a block in your login profile (`~/.bash_profile`, `~/.bash_login` or `~/.profile`, whichever bash reads) that starts the session when the gaming TTY logs in
 
 **The TTY is fixed once installed.** To change it: `~/.local/share/retrobox-labwc/install.sh --uninstall`, then install again. Running the installer again with the same TTY just updates.
 
-`--uninstall` removes all of the above, restores your profile and undoes the system part (the drop-in and the `enable` it made; an autologin of your own stays).
+`--uninstall` removes all of the above and the system part (service and rule). A session that is still running keeps running until `systemctl stop retrobox-labwc` or a reboot. An install of the previous version (login hook plus autologin drop-in) is migrated by simply running the installer again.
 
 ## Keyboard
 
@@ -52,7 +59,7 @@ The session always uses the system's keyboard: `/etc/default/keyboard` (Debian's
 sudo dpkg-reconfigure keyboard-configuration
 ```
 
-then press **Win+Shift+R** (or log out and in again).
+then press **Win+Shift+R** (or `systemctl restart retrobox-labwc`).
 
 ## Mouse pointer
 
@@ -77,11 +84,11 @@ internal_output = eDP-1         ; default: the first eDP/LVDS/DSI output
 external_output = HDMI-A-1      ; default: the first other output
 ```
 
-When Retrobox quits normally (exit status 0) the machine powers off; a crash, Win+Shift+E or a restart never do. That is the default of `./install.sh`; `--on-quit shell` leaves you at the shell prompt instead (the choice lives in `~/.config/retrobox-labwc/on_quit`, and a re-run keeps it unless you give the option again).
+When Retrobox quits normally (exit status 0) the machine powers off; a crash, Win+Shift+E or a restart never do. That is the default of `./install.sh`; `--on-quit shell` just ends the service instead, so the TTY shows its login prompt (the choice lives in `~/.config/retrobox-labwc/on_quit`, and a re-run keeps it unless you give the option again).
 
-`systemctl poweroff` and `reboot` (also the ones EmulationStation sends) need polkit to allow them. The installer writes `/etc/polkit-1/rules.d/50-retrobox-labwc.rules`, which lets your user power off and reboot from any session (`--no-polkit` skips it; `--uninstall` removes it; it needs `polkitd` installed). If a reboot is already in progress when Retrobox exits, the power off does not replace it.
+`systemctl poweroff` and `reboot` (also the ones EmulationStation sends) need polkit to allow them. The installer writes `/etc/polkit-1/rules.d/50-retrobox-labwc.rules`, which lets your user power off and reboot from any session and start, stop and restart `retrobox-labwc.service` without a password (`--no-polkit` skips it, and then those need `sudo`; `--uninstall` removes it; it needs `polkitd` installed). If a reboot is already in progress when Retrobox exits, the power off does not replace it.
 
-The session log is `~/.local/state/retrobox/logs/labwc-session.log`.
+The session log is `~/.local/state/retrobox/logs/labwc-session.log`; the service's own messages are in `journalctl -u retrobox-labwc`.
 
 ## Layout
 
@@ -89,7 +96,7 @@ The session log is `~/.local/state/retrobox/logs/labwc-session.log`.
 install.sh    the installer: --check, install, --uninstall
 bin/          retrobox-labwc-session
 libexec/      display switcher, mouse-hide, mouse-show, retrobox-labwc-common.sh (settings, keyboard)
-share/        labwc config templates, the login hook
+share/        labwc config templates
 tests/        smoke-test.sh (stand-in commands, throwaway HOME)
 ```
 
