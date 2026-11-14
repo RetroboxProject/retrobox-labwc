@@ -28,7 +28,8 @@ Installed by you, with your package manager (`./install.sh --check --tty N` tell
 | pipewire-pulse | `pipewire-pulse` | `pipewire-pulse` |
 | a terminal | `foot` (or `alacritty`) | `foot` |
 | dbus-run-session | `dbus-bin` | `dbus` |
-| recommended | `wlr-randr wireplumber xwayland wlrctl` | `wlr-randr wireplumber xorg-xwayland wlrctl` |
+| user bus (recommended) | `dbus-user-session` | `dbus` |
+| recommended | `wlr-randr wireplumber xwayland wlrctl pulseaudio-utils` | `wlr-randr wireplumber xorg-xwayland wlrctl libpulse` |
 
 plus `retrobox-core`, systemd and PAM (`libpam-systemd` on Debian). For any TTY but 1, `chvt` (package `kbd`) is needed too.
 
@@ -70,6 +71,15 @@ Two small standalone scripts in `libexec/` (they need only `wlrctl`, and `wlr-ra
 
 `wlrctl` can only move the pointer relatively, so `mouse-hide` sends it far past the corner (the compositor stops it at the edge) and `mouse-show` goes to the top-left corner and then back half the size of the screen, which it reads from `wlr-randr`.
 
+## Headphones
+
+`libexec/retrobox-audio-jack` (started by the session) keeps the audio card on its **analog duplex** profile while headphones are plugged into the jack and on **HDMI** while they are not (analog if there is no HDMI profile available). PipeWire reports the jack but keeps the analog profile available without headphones, so it never leaves it by itself. It reacts to the card events of the audio server (`pactl subscribe`) and needs `pactl`. Other profile names (`pactl list cards` shows them) go in `~/.config/retrobox-labwc/environment`:
+
+```
+RETROBOX_AUDIO_HEADPHONES_PROFILE=output:analog-stereo+input:analog-stereo
+RETROBOX_AUDIO_HDMI_PROFILE=output:hdmi-stereo
+```
+
 ## Resolution
 
 The session runs at whatever the kernel command line forces, and at nothing else's say. To limit it to 1280x720 at 60 Hz, add `video=CONNECTOR:1280x720@60` to `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub` (`sudo update-grub`, reboot); connector names are in `/sys/class/drm/card*-*/status` (e.g. `HDMI-A-2`). labwc's autostart applies that mode before Retrobox starts, and Win+P keeps it. Without a `video=`, the screen's preferred mode is used.
@@ -87,6 +97,8 @@ external_output = HDMI-A-1      ; default: the first other output
 When Retrobox quits normally (exit status 0) the machine powers off; a crash, Win+Shift+E or a restart never do. That is the default of `./install.sh`; `--on-quit shell` just ends the service instead, so the TTY shows its login prompt (the choice lives in `~/.config/retrobox-labwc/on_quit`, and a re-run keeps it unless you give the option again).
 
 `systemctl poweroff` and `reboot` (also the ones EmulationStation sends) need polkit to allow them. The installer writes `/etc/polkit-1/rules.d/50-retrobox-labwc.rules`, which lets your user power off and reboot from any session and start, stop and restart `retrobox-labwc.service` without a password (`--no-polkit` skips it, and then those need `sudo`; `--uninstall` removes it; it needs `polkitd` installed). If a reboot is already in progress when Retrobox exits, the power off does not replace it.
+
+**D-Bus.** The session uses your user bus (`$XDG_RUNTIME_DIR/bus`, run by systemd's user manager), so portals, pipewire and wireplumber are one set shared with everything else you run, and the compositor's environment (`WAYLAND_DISPLAY`, ...) is handed to that bus while the session lasts. Without a user bus (no `dbus-user-session` on Debian) it falls back to a private one with `dbus-run-session`; `RETROBOX_LABWC_PRIVATE_BUS=1` forces that fallback.
 
 The session log is `~/.local/state/retrobox/logs/labwc-session.log`; the service's own messages are in `journalctl -u retrobox-labwc`.
 

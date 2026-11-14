@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Audio profile by headphones: with headphones plugged into the analog jack
+# the card uses its analog duplex profile; without them it uses HDMI (and the
+# analog duplex profile if no HDMI profile is available, e.g. no monitor).
+#
+# The jack reports itself (the port analog-output-headphones is "available"
+# or "not available"), but the analog profile stays available without
+# headphones, so WirePlumber never leaves it by itself. This does.
+#
+# It runs once at start and again on every card event of the audio server
+# (pactl subscribe, so it works on PipeWire through pipewire-pulse), plus
+# every 30 seconds as a safety net. One instance per session.
+#
+# Usage: retrobox-audio-jack [--once]
+#   --once   apply the profile once and exit
+#
+# Environment (all optional):
+#   RETROBOX_AUDIO_HEADPHONES_PROFILE  default output:analog-stereo+input:analog-stereo
+#   RETROBOX_AUDIO_HDMI_PROFILE        default: the first available output:hdmi-stereo*
+#                                      profile, preferring one with analog input
+set -uo pipefail
+
+readonly HEADPHONES_PROFILE="${RETROBOX_AUDIO_HEADPHONES_PROFILE:-output:analog-stereo+input:analog-stereo}"
+readonly HDMI_PROFILE="${RETROBOX_AUDIO_HDMI_PROFILE:-}"
+readonly PORT="analog-output-headphones"
+
+log() { printf 'retrobox-audio-jack: %s\n' "$*" >&2; }
+
+# What read_card finds in `pactl list cards`, for the card with the headphone
+# port: its name, active profile, whether the headphones are plugged and its
+# profiles as "name yes|no" (available).
+CARD=""
+ACTIVE=""
+HEADPHONES=0
+PROFILES=()
+
+read_card() {
+  local line name avail cur_name="" cur_active="" cur_hp=-1
+  local -a cur_profiles=()
+  CARD="" ACTIVE="" HEADPHONES=0 PROFILES=()
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    case "${line}" in
+    "Card #"*)
+      ((cur_hp >= 0)) && break
+      cur_name="" cur_active="" cur_hp=-1 cur_profiles=()
+      ;;
+    $'\t'"Name: "*) cur_name="${line#*Name: }" ;;
+    $'\t'"Active Profile: "*) cur_active="${line#*Active Profile: }" ;;
+    $'\t\t'"${PORT}: "*)
+      if [[ "${line}" == *", available)" ]]; then cur_hp=1; else cur_hp=0; fi
+      ;;
+    $'\t\t'*"(sinks: "*"available: "*")")
+      name="${line#$'\t\t'}"
+      name="${name%%: *}"
+      avail="no"
+      [[ "${line}" == *"available: yes)" ]] && avail="yes"
+      cur_profiles+=("${name} ${avail}")
+      ;;
+    *) ;;
+    esac
+  done < <(LC_ALL=C pactl list cards 2>/dev/null)
+  ((cur_hp >= 0)) || return 1
+  CARD="${cur_name}" ACTIVE="${cur_active}" HEADPHONES="${cur_hp}" PROFILES=("${cur_profiles[@]}")
+}
+
+# has_profile NAME [available]: the card has the profile (and, if asked, it is available).
+has_profile() {
+  local entry
+  for entry in "${PROFILES[@]}"; do
+    [[ "${entry% *}" == "$1" ]] || continue
+    [[ -z "${2:-}" || "${entry#* }" == "yes" ]] && return 0
+  done
+  return 1
+}
+
+# The HDMI profile to use: the configured one, else the first available
+# output:hdmi-stereo*, preferring one that keeps the analog input.
+pick_hdmi() {
+  local entry name best=""
+  if [[ -n "${HDMI_PROFILE}" ]]; then
+    has_profile "${HDMI_PROFILE}" available && printf '%s\n' "${HDMI_PROFILE}"
+    return 0
+  fi
+  for entry in "${PROFILES[@]}"; do
+    name="${entry% *}"
+    [[ "${entry#* }" == "yes" && "${name}" == output:hdmi-stereo* ]] || continue
+    if [[ "${name}" == *"+input:analog-stereo" ]]; then
+      printf '%s\n' "${name}"
+      return 0
+    fi
+    [[ -n "${best}" ]] || best="${name}"
+  done
+  [[ -z "${best}" ]] || printf '%s\n' "${best}"
+}
+
+apply() {
+  local target
+  read_card || return 0
+  if ((HEADPHONES == 1)); then
+    target="${HEADPHONES_PROFILE}"
+  else
+    target="$(pick_hdmi)"
+    [[ -n "${target}" ]] || target="${HEADPHONES_PROFILE}"
+  fi
+  [[ "${ACTIVE}" != "${target}" ]] || return 0
+  if ! has_profile "${target}"; then
+    log "the card ${CARD} has no profile ${target}; leaving ${ACTIVE}"
+    return 0
+  fi
+  log "headphones $((HEADPHONES == 1 ? 1 : 0)): ${ACTIVE} -> ${target}"
+  pactl set-card-profile "${CARD}" "${target}" || log "could not set ${target}"
+}
+
+wait_for_audio() {
+  local i
+  for ((i = 0; i < 60; i++)); do
+    pactl info >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+command -v pactl >/dev/null 2>&1 || { log "pactl not found (pipewire-pulse / pulseaudio-utils)"; exit 1; }
+
+if [[ "${1:-}" == "--once" ]]; then
+  wait_for_audio || { log "no audio server"; exit 1; }
+  apply
+  exit 0
+fi
+
+# One instance per session: a restarted labwc finds the old one still there.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"${XDG_RUNTIME_DIR:-/tmp}/retrobox-audio-jack.lock"
+  flock -n 9 || exit 0
+fi
+
+wait_for_audio || { log "no audio server"; exit 1; }
+while :; do
+  apply
+  # an event (a line) or the 30 s timeout (status > 128) both re-check
+  while IFS= read -r -t 30 line || (($? > 128)); do
+    case "${line}" in
+    "" | *" on card "*) apply ;;
+    *) ;;
+    esac
+  done < <(pactl subscribe 2>/dev/null)
+  sleep 2 # the audio server went away: wait for it and subscribe again
+  wait_for_audio || exit 1
+done

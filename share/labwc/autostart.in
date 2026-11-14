@@ -19,6 +19,9 @@ fi
 # already running (or if there is no systemd user manager).
 systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber.service >/dev/null 2>&1 &
 
+# Headphones in the analog jack: analog duplex profile; out: HDMI.
+@LABWC_DIR@/libexec/retrobox-audio-jack &
+
 # Pick the active display output for the gaming session.
 @LABWC_DIR@/libexec/retrobox-switch-display &
 

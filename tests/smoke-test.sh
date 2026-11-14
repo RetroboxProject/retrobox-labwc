@@ -233,6 +233,43 @@ grep -q '^private-bus$' "${RUNS}" || fail "RETROBOX_LABWC_PRIVATE_BUS ignored"
 rm -f "${XDG_RUNTIME_DIR}/bus"
 pass "the session uses the user bus when there is one, dbus-run-session otherwise"
 
+# --- 8d. retrobox-audio-jack: analog duplex with headphones, HDMI without --------------------
+# A stand-in pactl whose "list cards" comes from a file; set-card-profile is recorded.
+printf '#!/bin/sh\ncase "$1" in\n  info) exit 0 ;;\n  list) cat "%s/cards.txt" ;;\n  set-card-profile) echo "$2 $3" >"%s/profile-set" ;;\nesac\n' "${STUB_STATE}" "${STUB_STATE}" >"${STUBS}/pactl"
+chmod +x "${STUBS}/pactl"
+# cards HEADPHONES(available|not available) ACTIVE HDMI(yes|no)
+cards() {
+  printf 'Card #46\n\tName: alsa_card.pci-0000_00_03.0\n\tProfiles:\n' >"${STUB_STATE}/cards.txt"
+  {
+    printf '\t\toutput:analog-stereo+input:analog-stereo: Duplex (sinks: 1, sources: 1, priority: 6565, available: yes)\n'
+    printf '\t\toutput:hdmi-stereo: HDMI (sinks: 1, sources: 0, priority: 5900, available: %s)\n' "$3"
+    printf '\t\toutput:hdmi-stereo+input:analog-stereo: HDMI y entrada (sinks: 1, sources: 1, priority: 5965, available: %s)\n' "$3"
+    printf '\t\toff: Off (sinks: 0, sources: 0, priority: 0, available: yes)\n'
+    printf '\tActive Profile: %s\n\tPorts:\n' "$2"
+    printf '\t\tanalog-output-headphones: Auriculares (type: Headphones, priority: 9900, availability group: Legacy 3, %s)\n' "$1"
+  } >>"${STUB_STATE}/cards.txt"
+  rm -f "${STUB_STATE}/profile-set"
+}
+JACK="${ROOT}/libexec/retrobox-audio-jack"
+ANALOG="output:analog-stereo+input:analog-stereo"
+cards "not available" "${ANALOG}" yes
+"${JACK}" --once 2>/dev/null
+[[ "$(cat "${STUB_STATE}/profile-set")" == "alsa_card.pci-0000_00_03.0 output:hdmi-stereo+input:analog-stereo" ]] || fail "no HDMI profile without headphones: $(cat "${STUB_STATE}/profile-set" 2>&1)"
+cards "available" "output:hdmi-stereo+input:analog-stereo" yes
+"${JACK}" --once 2>/dev/null
+[[ "$(cat "${STUB_STATE}/profile-set")" == "alsa_card.pci-0000_00_03.0 ${ANALOG}" ]] || fail "no analog profile with headphones"
+cards "not available" "${ANALOG}" no
+"${JACK}" --once 2>/dev/null
+[[ ! -e "${STUB_STATE}/profile-set" ]] || fail "left analog without an HDMI profile available"
+cards "available" "${ANALOG}" yes
+"${JACK}" --once 2>/dev/null
+[[ ! -e "${STUB_STATE}/profile-set" ]] || fail "changed a profile that was already right"
+cards "not available" "${ANALOG}" yes
+RETROBOX_AUDIO_HDMI_PROFILE=output:hdmi-stereo "${JACK}" --once 2>/dev/null
+[[ "$(cat "${STUB_STATE}/profile-set")" == "alsa_card.pci-0000_00_03.0 output:hdmi-stereo" ]] || fail "RETROBOX_AUDIO_HDMI_PROFILE ignored"
+grep -q 'retrobox-audio-jack' "${HOME}/.config/retrobox-labwc/autostart" || fail "audio jack script not in the autostart"
+pass "the audio profile follows the headphone jack: analog duplex with them, HDMI without"
+
 # --- 9. on_quit = poweroff: only a normal quit of retrobox powers off ---------------------
 [[ ! -e "${STUB_STATE}/poweroff" ]] || fail "powered off without being asked"
 printf '#!/bin/sh\nexit 0\n' >"${WORK}/core/bin/retrobox"

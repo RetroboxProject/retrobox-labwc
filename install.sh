@@ -110,6 +110,8 @@ pkg_name() {
   *:terminal) echo foot ;;
   *:wlr-randr) echo wlr-randr ;;
   *:wireplumber) echo wireplumber ;;
+  apt:pactl | dnf:pactl) echo pulseaudio-utils ;;
+  pacman:pactl) echo libpulse ;;
   apt:polkit) echo polkitd ;;
   pacman:polkit) echo polkit ;;
   apt:pipewire-pulse | pacman:pipewire-pulse) echo pipewire-pulse ;;
@@ -196,6 +198,7 @@ check_dependencies() {
   check_optional wireplumber wpctl "the volume keys" wpctl
   check_optional xwayland Xwayland "emulators that need X11" Xwayland
   check_optional polkit pkcheck "power off and reboot from the session" pkcheck
+  check_optional pactl pactl "the headphones/HDMI audio switch" pactl
   check_optional wlrctl wlrctl "mouse-hide and mouse-show, which move the pointer" wlrctl
   if find_retrobox_root >/dev/null; then
     ok "retrobox-core: $(find_retrobox_root)"
