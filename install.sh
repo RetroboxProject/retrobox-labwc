@@ -15,7 +15,10 @@
 # for your password through sudo): a drop-in
 # /etc/systemd/system/getty@ttyN.service.d/retrobox-labwc.conf with the
 # autologin and, for any TTY but 1, a VT switch to it at boot, and the getty
-# enabled at boot. Pass --no-system to leave the system alone.
+# enabled at boot. It also writes a polkit rule (50-retrobox-labwc.rules) that
+# lets your user power off and reboot from any session, so the systemctl
+# reboot/poweroff sent by EmulationStation always work. Pass --no-system to
+# leave the system alone, or --no-polkit to skip just that rule.
 #
 # It sets up, in your home only:
 #   * ~/.local/share/retrobox-labwc    this tree (so the checkout can go)
@@ -31,12 +34,16 @@
 #
 # Once installed, the TTY cannot be changed: uninstall first, then install.
 #
-# Usage: ./install.sh [--tty N] [--no-system] [--force]
+# Usage: ./install.sh [--tty N] [--on-quit poweroff|shell] [--no-system] [--no-polkit] [--force]
 #        ./install.sh --check [--tty N]
 #        ./install.sh --uninstall
 #   --tty N       gaming TTY (1-12); required the first time
+#   --on-quit X   what happens when Retrobox quits normally (exit status 0):
+#                 poweroff (the default the first time) or shell (stay at the
+#                 prompt); a re-run keeps the current choice unless given
 #   --check       only run the checks, change nothing
 #   --no-system   never touch /etc (no sudo): a missing autologin is an error
+#   --no-polkit   do not write the polkit rule for power off and reboot
 #   --force       install even if a check fails
 #   --uninstall   remove everything this script set up, /etc drop-in included
 #   -h, --help
@@ -59,6 +66,7 @@ readonly TTY_DROPIN="${RETROBOX_CONFIG_DIR}/retrobox.ini.d/50-labwc.ini"
 readonly MANIFEST="${DATA_DIR}/.install-manifest"
 readonly BIN_DIR="${HOME}/.local/bin"
 readonly SESSION_LINK="${BIN_DIR}/retrobox-labwc-session"
+readonly POLKIT_DIR="${RETROBOX_POLKIT_DIR:-/etc/polkit-1/rules.d}"
 readonly SYSTEMD_DIR="${RETROBOX_SYSTEMD_DIR:-/etc/systemd/system}"
 readonly OS_RELEASE="${RETROBOX_OS_RELEASE:-/etc/os-release}"
 # the files bash reads for a login shell, in the order it tries them
@@ -101,6 +109,8 @@ pkg_name() {
   *:terminal) echo foot ;;
   *:wlr-randr) echo wlr-randr ;;
   *:wireplumber) echo wireplumber ;;
+  apt:polkit) echo polkitd ;;
+  pacman:polkit) echo polkit ;;
   apt:pipewire-pulse | pacman:pipewire-pulse) echo pipewire-pulse ;;
   dnf:pipewire-pulse) echo pipewire-pulseaudio ;;
   apt:dbus) echo dbus-bin ;;
@@ -171,6 +181,7 @@ check_dependencies() {
   check_optional wlr-randr wlr-randr "Win+P, the display switch" wlr-randr
   check_optional wireplumber wpctl "the volume keys" wpctl
   check_optional xwayland Xwayland "emulators that need X11" Xwayland
+  check_optional polkit pkcheck "power off and reboot from the session" pkcheck
   check_optional wlrctl wlrctl "mouse-hide and mouse-show, which move the pointer" wlrctl
   if find_retrobox_root >/dev/null; then
     ok "retrobox-core: $(find_retrobox_root)"
@@ -313,6 +324,57 @@ install_system() {
   sudo systemctl daemon-reload
 }
 
+# merge_notes: SYSTEM_NOTES plus, for each key it lacks, the line an earlier
+# run recorded (a re-run that finds everything in place adds nothing).
+merge_notes() {
+  local key line
+  for key in system_dropin getty_enabled polkit_rule; do
+    grep -q "^${key}=" <<<"${SYSTEM_NOTES}" && continue
+    line="$(grep "^${key}=" <<<"${PREV_NOTES}" || true)"
+    [[ -z "${line}" ]] || SYSTEM_NOTES+="${line}"$'\n'
+  done
+}
+
+polkit_rule_path() {
+  printf '%s/50-retrobox-labwc.rules\n' "${POLKIT_DIR}"
+}
+
+polkit_rule_content() {
+  cat <<RULE
+// Written ${GENERATED_MARK}: ${USER_NAME} may power off and reboot from any
+// session (EmulationStation sends systemctl poweroff and reboot).
+polkit.addRule(function(action, subject) {
+  if (subject.user == "${USER_NAME}" &&
+      (action.id.indexOf("org.freedesktop.login1.power-off") == 0 ||
+       action.id.indexOf("org.freedesktop.login1.reboot") == 0)) {
+    return polkit.Result.YES;
+  }
+});
+RULE
+}
+
+# Lets the user power off and reboot without a password from any session.
+install_polkit_rule() {
+  local file tmp
+  file="$(polkit_rule_path)"
+  if ! have pkcheck; then
+    warn "polkit is not installed: no rule written, power off and reboot may ask for a password."
+    return 0
+  fi
+  if [[ -f "${file}" && "$(cat -- "${file}")" == "$(polkit_rule_content)" ]]; then
+    ok "polkit rule already in place (${file})"
+    return 0
+  fi
+  have sudo || die "sudo is needed for the polkit rule (or use --no-polkit)"
+  info "Writing the polkit rule (sudo): ${file}"
+  tmp="$(mktemp)"
+  polkit_rule_content >"${tmp}"
+  sudo install -d -m 0755 -- "${POLKIT_DIR}" || die "sudo failed"
+  sudo install -m 0644 -- "${tmp}" "${file}" || die "sudo failed"
+  rm -f -- "${tmp}"
+  SYSTEM_NOTES+="polkit_rule=${file}"$'\n'
+}
+
 report_keyboard() {
   detect_keyboard
   info "Keyboard: ${XKB_LAYOUT}${XKB_VARIANT:+ ${XKB_VARIANT}} (from ${KB_SOURCE})"
@@ -395,6 +457,16 @@ write_labwc_config() {
   ln -sfn -- "${DATA_DIR}/share/labwc/themerc-override" "${CONFIG_DIR}/themerc-override"
 }
 
+# What a normal quit of retrobox does: the choice given, else the one already
+# installed, else power off. The session reads it from this file.
+write_on_quit() {
+  local file="${CONFIG_DIR}/on_quit"
+  [[ -n "${ON_QUIT}" ]] || ON_QUIT="$(cat -- "${file}" 2>/dev/null || true)"
+  [[ -n "${ON_QUIT}" ]] || ON_QUIT="poweroff"
+  info "When retrobox quits normally: ${ON_QUIT} (${file})"
+  printf '%s\n' "${ON_QUIT}" >"${file}"
+}
+
 write_tty_setting() {
   info "Gaming TTY: ${TTY} (${TTY_DROPIN})"
   mkdir -p -- "$(dirname -- "${TTY_DROPIN}")"
@@ -470,7 +542,7 @@ do_install() {
   local prev
 
   # what an earlier run did to the system, kept when this one has nothing to add
-  PREV_NOTES="$(grep -E '^(system_dropin|getty_enabled)=' "${MANIFEST}" 2>/dev/null || true)"
+  PREV_NOTES="$(grep -E '^(system_dropin|getty_enabled|polkit_rule)=' "${MANIFEST}" 2>/dev/null || true)"
   if prev="$(installed_tty)"; then
     if [[ -n "${TTY_ARG}" ]] && ((10#${TTY_ARG} != 10#${prev})); then
       die "already installed on tty${prev}: run ./install.sh --uninstall before using tty${TTY_ARG}"
@@ -502,6 +574,8 @@ do_install() {
     fi
   fi
 
+  if ((SYSTEM == 1 && POLKIT == 1)); then install_polkit_rule; fi
+
   case "${DATA_DIR}${CONFIG_DIR}" in
   *[[:space:]\&\<\>\'\"\\]*) die "paths with spaces or quotes are not supported (${DATA_DIR}, ${CONFIG_DIR})" ;;
   *) ;;
@@ -509,6 +583,7 @@ do_install() {
 
   copy_tree
   write_labwc_config
+  write_on_quit
   write_tty_setting
   install_login_hook
   remove_legacy
@@ -517,30 +592,38 @@ do_install() {
   ln -sfn -- "${DATA_DIR}/bin/retrobox-labwc-session" "${SESSION_LINK}"
   [[ ":${PATH}:" == *":${BIN_DIR}:"* ]] || warn "${BIN_DIR} is not in your PATH (retrobox-labwc-session is linked there)."
 
-  [[ -n "${SYSTEM_NOTES}" || -z "${PREV_NOTES}" ]] || SYSTEM_NOTES="${PREV_NOTES}"$'\n'
+  merge_notes
   printf 'tty=%s\nuser=%s\ndate=%s\n%s' "${TTY}" "${USER_NAME}" "$(date -Iseconds)" "${SYSTEM_NOTES}" >"${MANIFEST}"
   ok "Installed. Log in on tty${TTY} (or reboot) to start the session."
   info "Remove it with: ${DATA_DIR}/install.sh --uninstall"
 }
 
 # ------------------------------------------------------------- uninstall
-# Undoes what install_system recorded in the manifest.
+# Undoes what install_system and install_polkit_rule recorded in the manifest.
 uninstall_system() {
-  local dropin enabled tty
+  local dropin enabled rule tty
   dropin="$(sed -n 's/^system_dropin=//p' "${MANIFEST}" 2>/dev/null | head -n1)"
   enabled="$(sed -n 's/^getty_enabled=//p' "${MANIFEST}" 2>/dev/null | head -n1)"
+  rule="$(sed -n 's/^polkit_rule=//p' "${MANIFEST}" 2>/dev/null | head -n1)"
   tty="$(installed_tty || true)"
-  [[ -n "${dropin}" ]] || return 1
+  [[ -n "${dropin}${rule}" ]] || return 1
   if ((SYSTEM == 0)) || ! have sudo; then
-    warn "Left in the system (remove as root): ${dropin}"
+    [[ -z "${dropin}" ]] || warn "Left in the system (remove as root): ${dropin}"
     [[ -z "${enabled}" ]] || warn "  and: systemctl disable getty@tty${tty}.service"
+    [[ -z "${rule}" ]] || warn "Left in the system (remove as root): ${rule}"
     return 0
   fi
-  info "Removing ${dropin} (sudo)..."
-  grep -qsF "${GENERATED_MARK}" "${dropin}" && sudo rm -f -- "${dropin}"
-  sudo rmdir --ignore-fail-on-non-empty -- "$(dirname -- "${dropin}")" 2>/dev/null || true
-  [[ -z "${enabled}" ]] || sudo systemctl disable "getty@tty${tty}.service" >/dev/null 2>&1 || true
-  sudo systemctl daemon-reload
+  if [[ -n "${rule}" ]]; then
+    info "Removing ${rule} (sudo)..."
+    grep -qsF "${GENERATED_MARK}" "${rule}" && sudo rm -f -- "${rule}"
+  fi
+  if [[ -n "${dropin}" ]]; then
+    info "Removing ${dropin} (sudo)..."
+    grep -qsF "${GENERATED_MARK}" "${dropin}" && sudo rm -f -- "${dropin}"
+    sudo rmdir --ignore-fail-on-non-empty -- "$(dirname -- "${dropin}")" 2>/dev/null || true
+    [[ -z "${enabled}" ]] || sudo systemctl disable "getty@tty${tty}.service" >/dev/null 2>&1 || true
+    sudo systemctl daemon-reload
+  fi
 }
 
 do_uninstall() {
@@ -588,7 +671,9 @@ do_uninstall() {
 # ------------------------------------------------------------------ main
 TTY_ARG=""
 FORCE=0
+ON_QUIT=""
 SYSTEM=1
+POLKIT=1
 CHECK_ONLY=0
 UNINSTALL=0
 while (($# > 0)); do
@@ -597,12 +682,20 @@ while (($# > 0)); do
     TTY_ARG="${2:?--tty needs a VT number}"
     shift 2
     ;;
+  --on-quit)
+    ON_QUIT="${2:?--on-quit needs poweroff or shell}"
+    shift 2
+    ;;
   --force)
     FORCE=1
     shift
     ;;
   --no-system)
     SYSTEM=0
+    shift
+    ;;
+  --no-polkit)
+    POLKIT=0
     shift
     ;;
   --check)
@@ -624,6 +717,7 @@ done
 USER_NAME="$(id -un)"
 readonly USER_NAME
 ((EUID != 0)) || die "run it as the user who plays, not as root: it needs no privileges"
+[[ -z "${ON_QUIT}" || "${ON_QUIT}" == "poweroff" || "${ON_QUIT}" == "shell" ]] || die "--on-quit needs poweroff or shell"
 [[ -z "${TTY_ARG}" ]] || is_valid_tty "${TTY_ARG}" || die "--tty needs a VT number between 1 and 12"
 
 if ((UNINSTALL == 1)); then

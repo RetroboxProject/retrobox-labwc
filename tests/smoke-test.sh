@@ -39,6 +39,7 @@ printf '#!/bin/sh\nexit 0\n' >"${WORK}/core/bin/retrobox-screenshot"
 # RETROBOX_SYSTEMD_DIR; "enabled" is a marker file. sudo just runs the command.
 export RETROBOX_SYSTEMD_DIR="${WORK}/systemd"
 export STUB_STATE="${WORK}/state"
+export RETROBOX_POLKIT_DIR="${WORK}/polkit"
 mkdir -p "${RETROBOX_SYSTEMD_DIR}" "${STUB_STATE}"
 cat >"${STUBS}/systemctl" <<'SH'
 #!/bin/sh
@@ -53,6 +54,7 @@ case "$1" in
   disable) rm -f "${STUB_STATE}/enabled-$2" ;;
   daemon-reload) exit 0 ;;
   poweroff) touch "${STUB_STATE}/poweroff" ;;
+  list-jobs) [ -e "${STUB_STATE}/reboot-pending" ] && echo "1 reboot.target start waiting" ; exit 0 ;;
   *) exit 1 ;;
 esac
 SH
@@ -120,6 +122,8 @@ grep -q '@DEFAULT_AUDIO_SINK@' "${HOME}/.config/retrobox-labwc/rc.xml" || fail "
 ! grep -q 'go2tty\|exit-tty' "${HOME}/.config/retrobox-labwc/rc.xml" || fail "leftovers in rc.xml"
 [[ "$(grep -c 'retrobox-labwc (managed' "${HOME}/.profile")" == 1 ]] || fail "hook block missing"
 grep -q '^export FOO=1$' "${HOME}/.profile" || fail "profile content damaged"
+RULE="${RETROBOX_POLKIT_DIR}/50-retrobox-labwc.rules"
+grep -q "subject.user == \"$(id -un)\"" "${RULE}" && grep -q 'login1.reboot' "${RULE}" && grep -q 'login1.power-off' "${RULE}" || fail "polkit rule wrong"
 pass "install renders everything inside the home directory"
 
 # --- 4. the TTY is locked once installed -----------------------------------------------
@@ -135,6 +139,7 @@ pass "the TTY cannot change without uninstall; re-install is idempotent"
 [[ ! -e "${DATA}" && ! -e "${HOME}/.config/retrobox-labwc" && ! -e "${HOME}/.config/retrobox/retrobox.ini.d/50-labwc.ini" ]] || fail "files left"
 [[ "$(cat "${HOME}/.profile")" == $'# my profile\nexport FOO=1' ]] || fail "profile not restored: $(cat "${HOME}/.profile")"
 [[ ! -e "${DROPIN}" && ! -e "${STUB_STATE}/enabled-getty@tty8.service" ]] || fail "system part not undone"
+[[ ! -e "${RULE}" ]] || fail "polkit rule not removed"
 [[ -e "${RETROBOX_SYSTEMD_DIR}/getty@tty2.service.d/autologin.conf" ]] || fail "uninstall touched a drop-in that is not ours"
 pass "uninstall restores the profile and undoes the system part"
 
@@ -174,7 +179,8 @@ pass "keyboard layout follows the system file"
 
 # --- 8. the session: starts labwc + retrobox, passes the keyboard, restarts on request ------
 printf 'XKBLAYOUT="es"\n' >"${RETROBOX_KEYBOARD_FILE}"
-install_sh --tty 8 >/dev/null 2>&1
+install_sh --tty 8 --on-quit shell >/dev/null 2>&1
+[[ "$(cat "${HOME}/.config/retrobox-labwc/on_quit")" == "shell" ]] || fail "--on-quit shell not written"
 RUNS="${WORK}/runs"
 : >"${RUNS}"
 # dbus-run-session -- CMD...
@@ -217,15 +223,32 @@ pass "the session starts, restarts on request and re-reads the keyboard"
 # --- 9. on_quit = poweroff: only a normal quit of retrobox powers off ---------------------
 [[ ! -e "${STUB_STATE}/poweroff" ]] || fail "powered off without being asked"
 printf '#!/bin/sh\nexit 0\n' >"${WORK}/core/bin/retrobox"
-mkdir -p "${HOME}/.config/retrobox/retrobox.ini.d"
-printf '[labwc]\non_quit = poweroff\n' >"${HOME}/.config/retrobox/retrobox.ini.d/60-quit.ini"
+install_sh --tty 8 >/dev/null 2>&1 # a re-run keeps the choice
+[[ "$(cat "${HOME}/.config/retrobox-labwc/on_quit")" == "shell" ]] || fail "re-run changed on_quit"
+install_sh --tty 8 --on-quit poweroff >/dev/null 2>&1
+[[ "$(cat "${HOME}/.config/retrobox-labwc/on_quit")" == "poweroff" ]] || fail "--on-quit poweroff not written"
 "${HOME}/.local/bin/retrobox-labwc-session" -f || fail "session failed"
 [[ -e "${STUB_STATE}/poweroff" ]] || fail "no poweroff after a normal quit"
 rm -f "${STUB_STATE}/poweroff"
 printf '#!/bin/sh\nexit 3\n' >"${WORK}/core/bin/retrobox"
 "${HOME}/.local/bin/retrobox-labwc-session" -f || true
 [[ ! -e "${STUB_STATE}/poweroff" ]] || fail "powered off after a crash"
-pass "on_quit = poweroff powers off after a normal quit, never after a failure"
+pass "a normal quit powers off when on_quit says so, never after a failure"
+printf '#!/bin/sh\nexit 0\n' >"${WORK}/core/bin/retrobox"
+touch "${STUB_STATE}/reboot-pending"
+"${HOME}/.local/bin/retrobox-labwc-session" -f || fail "session failed"
+[[ ! -e "${STUB_STATE}/poweroff" ]] || fail "poweroff replaced a reboot already in progress"
+rm -f "${STUB_STATE}/reboot-pending"
+pass "a reboot requested by retrobox is not overridden by the poweroff"
+expect_fail install_sh --on-quit reboot
+"${HOME}/.local/share/retrobox-labwc/install.sh" --uninstall >/dev/null 2>&1
+install_sh --tty 8 --no-polkit >/dev/null 2>&1 || fail "install --no-polkit failed"
+[[ ! -e "${RULE}" ]] || fail "--no-polkit still wrote the rule"
+pass "--no-polkit skips the rule"
+rm -rf "${HOME}/.config/retrobox-labwc" "${HOME}/.local/share/retrobox-labwc"
+install_sh --tty 8 >/dev/null 2>&1
+[[ "$(cat "${HOME}/.config/retrobox-labwc/on_quit")" == "poweroff" ]] || fail "first install must default to poweroff"
+pass "the first install powers off on quit by default"
 
 # --- 10. the resolution is the kernel command line's video=, nothing else -----------------
 RANDR_LOG="${WORK}/randr.log"

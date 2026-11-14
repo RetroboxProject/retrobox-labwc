@@ -31,7 +31,7 @@ git clone https://github.com/RetroboxProject/retrobox-labwc && cd retrobox-labwc
 ./install.sh --tty 1        # --check --tty 1 only checks; --force installs even if a check fails
 ```
 
-The machine should log in on the gaming TTY by itself and boot on it. If that is not so yet, the installer sets it up, and this is the only thing that needs root (it asks for your password through `sudo`; `--no-system` skips it): a drop-in `/etc/systemd/system/getty@ttyN.service.d/retrobox-labwc.conf` with the getty autologin and, for any TTY but 1, a switch to it at boot (`chvt N`), plus `systemctl enable getty@ttyN`. An autologin you already have on that TTY is kept and only completed; one for another user is never overridden. `./install.sh --check` prints what it would write.
+The machine should log in on the gaming TTY by itself and boot on it. If that is not so yet, the installer sets it up, and this is the only thing that needs root (it asks for your password through `sudo`; `--no-system` skips it, plus the polkit rule below): a drop-in `/etc/systemd/system/getty@ttyN.service.d/retrobox-labwc.conf` with the getty autologin and, for any TTY but 1, a switch to it at boot (`chvt N`), plus `systemctl enable getty@ttyN`. An autologin you already have on that TTY is kept and only completed; one for another user is never overridden. `./install.sh --check` prints what it would write.
 
 Everything lands in your home:
 
@@ -77,14 +77,9 @@ internal_output = eDP-1         ; default: the first eDP/LVDS/DSI output
 external_output = HDMI-A-1      ; default: the first other output
 ```
 
-To power the machine off when Retrobox quits normally (exit status 0; a crash, Win+Shift+E or a restart never does), in any layer:
+When Retrobox quits normally (exit status 0) the machine powers off; a crash, Win+Shift+E or a restart never do. That is the default of `./install.sh`; `--on-quit shell` leaves you at the shell prompt instead (the choice lives in `~/.config/retrobox-labwc/on_quit`, and a re-run keeps it unless you give the option again).
 
-```ini
-[labwc]
-on_quit = poweroff              ; default: shell (you are left at the prompt)
-```
-
-It runs `systemctl poweroff` as your user, which needs polkit on a minimal system (`polkitd`, which lets the active local session power off); check it with `systemctl poweroff` from a shell on the gaming TTY before relying on it.
+`systemctl poweroff` and `reboot` (also the ones EmulationStation sends) need polkit to allow them. The installer writes `/etc/polkit-1/rules.d/50-retrobox-labwc.rules`, which lets your user power off and reboot from any session (`--no-polkit` skips it; `--uninstall` removes it; it needs `polkitd` installed). If a reboot is already in progress when Retrobox exits, the power off does not replace it.
 
 The session log is `~/.local/state/retrobox/logs/labwc-session.log`.
 
