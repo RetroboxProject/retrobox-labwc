@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Puts the mouse pointer in the centre of the screen (the opposite of
+# mouse-hide). Standalone: copy it anywhere (e.g. a retrobox retrohook), it
+# needs only wlrctl and wlr-randr.
+#
+# wlrctl can only move the pointer relative to where it is, so this first
+# sends it to the top-left corner (a move far bigger than any screen is
+# stopped at the edge) and then moves it half the size of the screen: the
+# first enabled output, in the layout units wlr-randr reports.
+#
+# Usage: mouse-show
+set -euo pipefail
+
+for cmd in wlrctl wlr-randr; do
+  command -v "${cmd}" >/dev/null 2>&1 || { echo "mouse-show: ${cmd} is not installed" >&2; exit 1; }
+done
+
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+# "X Y": the centre of the first enabled output (its current mode, divided
+# by the scale, swapped for a rotated screen, plus its position).
+centre="$(wlr-randr | awk '
+  function flush() {
+    if (!done && enabled && w > 0) {
+      if (transform ~ /90|270/) { t = w; w = h; h = t }
+      printf "%d %d\n", px + w / scale / 2, py + h / scale / 2
+      done = 1
+    }
+  }
+  /^[^[:space:]]/ { flush(); enabled = 0; w = 0; h = 0; px = 0; py = 0; scale = 1; transform = "normal" }
+  /Enabled:/ { enabled = ($2 == "yes") }
+  /^[[:space:]]+[0-9]+x[0-9]+ px/ && /current/ { split($1, size, "x"); w = size[1]; h = size[2] }
+  /Position:/ { split($2, pos, ","); px = pos[1]; py = pos[2] }
+  /Scale:/ { scale = $2 }
+  /Transform:/ { transform = $2 }
+  END { flush() }
+')"
+[[ -n "${centre}" ]] || { echo "mouse-show: no enabled output found" >&2; exit 1; }
+read -r x y <<<"${centre}"
+
+wlrctl pointer move -32767 -32767
+exec wlrctl pointer move "${x}" "${y}"

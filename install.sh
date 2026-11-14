@@ -171,6 +171,7 @@ check_dependencies() {
   check_optional wlr-randr wlr-randr "Win+P, the display switch" wlr-randr
   check_optional wireplumber wpctl "the volume keys" wpctl
   check_optional xwayland Xwayland "emulators that need X11" Xwayland
+  check_optional wlrctl wlrctl "mouse-hide and mouse-show, which move the pointer" wlrctl
   if find_retrobox_root >/dev/null; then
     ok "retrobox-core: $(find_retrobox_root)"
   else

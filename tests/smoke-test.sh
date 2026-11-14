@@ -256,4 +256,45 @@ randr_with() { # randr_with CMDLINE ARG: what wlr-randr was asked to do
 grep -q 'retrobox-switch-display mode' "${HOME}/.config/retrobox-labwc/autostart" || fail "autostart does not apply the mode first"
 pass "the resolution follows video= on the kernel command line, and only that"
 
+# --- 11. mouse-hide / mouse-show ----------------------------------------------------------
+WLRCTL_LOG="${WORK}/wlrctl.log"
+printf '#!/bin/sh\necho "$*" >>"%s"\n' "${WLRCTL_LOG}" >"${STUBS}/wlrctl"
+chmod +x "${STUBS}/wlrctl"
+fake_randr() { # fake_randr MODE POSITION SCALE TRANSFORM: one enabled output, one disabled
+  cat >"${STUBS}/wlr-randr" <<SH
+#!/bin/sh
+cat <<'OUT'
+DP-1 "off"
+  Enabled: no
+  Modes:
+    3840x2160 px, 60.000000 Hz (preferred, current)
+  Position: 0,0
+  Scale: 1.000000
+  Transform: normal
+HDMI-A-2 "LG"
+  Enabled: yes
+  Modes:
+    1920x1080 px, 60.000000 Hz (preferred)
+    $1 px, 60.000000 Hz (current)
+  Position: $2
+  Transform: $4
+  Scale: $3
+OUT
+SH
+  chmod +x "${STUBS}/wlr-randr"
+}
+: >"${WLRCTL_LOG}"
+"${ROOT}/libexec/mouse-hide" || fail "mouse-hide failed"
+[[ "$(cat "${WLRCTL_LOG}")" == "pointer move 32767 32767" ]] || fail "mouse-hide wrong: $(cat "${WLRCTL_LOG}")"
+centre_of() { : >"${WLRCTL_LOG}"; fake_randr "$@"; "${ROOT}/libexec/mouse-show" || fail "mouse-show failed"; tail -n1 "${WLRCTL_LOG}"; }
+[[ "$(centre_of 1280x720 0,0 1.000000 normal)" == "pointer move 640 360" ]] || fail "centre of 1280x720"
+[[ "$(head -n1 "${WLRCTL_LOG}")" == "pointer move -32767 -32767" ]] || fail "mouse-show must start from the corner"
+[[ "$(centre_of 1920x1080 0,0 2.000000 normal)" == "pointer move 480 270" ]] || fail "scale ignored"
+[[ "$(centre_of 1920x1080 0,0 1.000000 90)" == "pointer move 540 960" ]] || fail "rotation ignored"
+[[ "$(centre_of 1280x720 1920,0 1.000000 normal)" == "pointer move 2560 360" ]] || fail "position ignored"
+PATH="${WORK}/bare" expect_fail "$(command -v bash)" "${ROOT}/libexec/mouse-hide"
+grep -q 'wlrctl is not installed' "${WORK}/out" || fail "missing wlrctl not reported"
+grep -q 'libexec/mouse-hide' "${HOME}/.config/retrobox-labwc/autostart" || fail "autostart does not run mouse-hide"
+pass "mouse-hide parks the pointer in the corner, mouse-show centres it"
+
 echo "All smoke tests passed."

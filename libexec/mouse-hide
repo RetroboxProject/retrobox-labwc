@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Parks the mouse pointer in the bottom-right corner of the screen, out of
+# the way (labwc's autostart runs it when the session starts). Standalone:
+# copy it anywhere (e.g. a retrobox retrohook), it needs only wlrctl.
+#
+# Usage: mouse-hide
+set -euo pipefail
+
+command -v wlrctl >/dev/null 2>&1 || { echo "mouse-hide: wlrctl is not installed" >&2; exit 1; }
+
+# Where the labwc session is; retrobox already has it in its environment,
+# the fallbacks are for running this by hand.
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+# A relative move far bigger than any screen: the compositor stops the
+# pointer at the edge of the screen, so no resolution is needed.
+exec wlrctl pointer move 32767 32767

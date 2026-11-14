@@ -21,3 +21,6 @@ systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber.service
 
 # Pick the active display output for the gaming session.
 @LABWC_DIR@/libexec/retrobox-switch-display &
+
+# Park the mouse pointer in the bottom-right corner, out of the way.
+@LABWC_DIR@/libexec/mouse-hide &
