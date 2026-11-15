@@ -73,7 +73,7 @@ Two small standalone scripts in `libexec/` (they need only `wlrctl`, and `wlr-ra
 
 ## Headphones
 
-`libexec/retrobox-audio-jack` (started by the session) keeps the audio card on its **analog duplex** profile while headphones are plugged into the jack and on **HDMI** while they are not (analog if there is no HDMI profile available). PipeWire reports the jack but keeps the analog profile available without headphones, so it never leaves it by itself. It reacts to the card events of the audio server (`pactl subscribe`) and needs `pactl`. Other profile names (`pactl list cards` shows them) go in `~/.config/retrobox-labwc/environment`:
+`libexec/retrobox-audio-jack` (started by the session) keeps the audio card on its **analog duplex** profile while headphones are plugged into the jack and on **HDMI** while they are not (analog if there is no HDMI profile available). PipeWire reports the jack but keeps the analog profile available without headphones, so it never leaves it by itself. It reacts to the card events of the audio server (`pactl subscribe`) and needs `pactl`. It only acts when what it wants changes (headphones plugged or unplugged, an HDMI profile becoming available, the session starting): a profile chosen by hand meanwhile, such as from the overlay's audio page or pavucontrol, is left alone until the next change. Other profile names (`pactl list cards` shows them) go in `~/.config/retrobox-labwc/environment`:
 
 ```
 RETROBOX_AUDIO_HEADPHONES_PROFILE=output:analog-stereo+input:analog-stereo

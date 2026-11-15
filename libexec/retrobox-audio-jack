@@ -11,6 +11,11 @@
 # (pactl subscribe, so it works on PipeWire through pipewire-pulse), plus
 # every 30 seconds as a safety net. One instance per session.
 #
+# It changes the profile only when what it wants changes (headphones
+# plugged or unplugged, an HDMI profile becoming available), not whenever the
+# card differs from it: a profile chosen by hand (the overlay's audio page,
+# pavucontrol...) stays until the next such change.
+#
 # Usage: retrobox-audio-jack [--once]
 #   --once   apply the profile once and exit
 #
@@ -93,6 +98,10 @@ pick_hdmi() {
   [[ -z "${best}" ]] || printf '%s\n' "${best}"
 }
 
+# The profile last wanted (and reached) for the card, so that what is chosen
+# by hand is not undone: the profile is only set when the wish changes.
+WANTED=""
+
 apply() {
   local target
   read_card || return 0
@@ -102,13 +111,21 @@ apply() {
     target="$(pick_hdmi)"
     [[ -n "${target}" ]] || target="${HEADPHONES_PROFILE}"
   fi
-  [[ "${ACTIVE}" != "${target}" ]] || return 0
+  [[ "${CARD} ${target}" != "${WANTED}" ]] || return 0
+  if [[ "${ACTIVE}" == "${target}" ]]; then
+    WANTED="${CARD} ${target}"
+    return 0
+  fi
   if ! has_profile "${target}"; then
     log "the card ${CARD} has no profile ${target}; leaving ${ACTIVE}"
     return 0
   fi
   log "headphones $((HEADPHONES == 1 ? 1 : 0)): ${ACTIVE} -> ${target}"
-  pactl set-card-profile "${CARD}" "${target}" || log "could not set ${target}"
+  if pactl set-card-profile "${CARD}" "${target}"; then
+    WANTED="${CARD} ${target}"
+  else
+    log "could not set ${target}"
+  fi
 }
 
 wait_for_audio() {
