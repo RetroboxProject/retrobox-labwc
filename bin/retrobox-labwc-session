@@ -139,7 +139,7 @@ share_env() {
   log "compositor environment shared with the user bus"
 }
 
-# shellcheck disable=SC2329  # runs as the EXIT trap
+# shellcheck disable=SC2317,SC2329  # runs as the EXIT trap
 unshare_env() {
   systemctl --user unset-environment "${ACTIVATION_VARS[@]}" >/dev/null 2>&1 || true
 }
@@ -325,7 +325,7 @@ trap kill_labwc EXIT
 session_pid=""
 # A stop request: ask the inner half (which closes retrobox, then labwc) to
 # stop, give it time, then leave; the EXIT trap above is the backstop.
-# shellcheck disable=SC2329  # runs as the TERM trap
+# shellcheck disable=SC2317,SC2329  # runs as the TERM trap
 on_stop() {
   local i
   log "stop requested"
