@@ -195,7 +195,7 @@ check_dependencies() {
   fi
   ((tty == 1)) || check_required kbd "chvt (to boot on tty${tty})" chvt
   check_optional wlr-randr wlr-randr "Win+P, the display switch" wlr-randr
-  check_optional wireplumber wpctl "the volume keys" wpctl
+  check_optional wireplumber wpctl "the volume keys (else pactl or retrobox-overlay)" wpctl
   check_optional xwayland Xwayland "emulators that need X11" Xwayland
   check_optional polkit pkcheck "power off and reboot from the session" pkcheck
   check_optional pactl pactl "the headphones/HDMI audio switch" pactl
@@ -443,7 +443,7 @@ sed_escape() {
 }
 
 # render TEMPLATE DESTINATION: fills in the @...@ placeholders of this
-# install (and nothing else: rc.xml has wpctl's own @DEFAULT_AUDIO_SINK@).
+# install (and nothing else: rc.xml has wpctl's own @DEFAULT_AUDIO_SOURCE@).
 render() {
   sed -e "s|@LABWC_DIR@|$(sed_escape "${DATA_DIR}")|g" \
     -e "s|@TERMINAL@|$(sed_escape "${TERMINAL}")|g" \

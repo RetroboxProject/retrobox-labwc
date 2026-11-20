@@ -14,7 +14,7 @@ systemctl restart retrobox-labwc   # start over (e.g. after a keyboard change)
 
 - **Win+P** switches the display output (internal panel ⇄ external screen).
 - **Win+Shift+R** restarts the session (it re-reads the system keyboard), **Win+Shift+E** exits labwc and ends it.
-- The mouse pointer is parked in the bottom-right corner when the session starts (see [Mouse pointer](#mouse-pointer)). The volume keys (capped at 100%, no distorted boost), **Print** (Retrobox screenshot), **Alt+Tab**, **Alt+F4** and **Win+T** (terminal) work as usual.
+- The mouse pointer is parked in the bottom-right corner when the session starts (see [Mouse pointer](#mouse-pointer)). The volume keys (5% a press, capped at 100%, no distorted boost; through `retrobox-overlay --volume` when the overlay is installed, which can show the volume, else `wpctl` or `pactl`), **Print** (Retrobox screenshot), **Alt+Tab**, **Alt+F4** and **Win+T** (terminal) work as usual.
 
 Retrobox ending closes labwc; unless the machine is set to power off, the service ends and the TTY shows its login prompt.
 

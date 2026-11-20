@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# The volume keys (labwc's keybinds): Retrobox's overlay when it is
+# installed (`retrobox-overlay --volume`, which can also show the volume:
+# [volume] toast in overlay.ini), else wpctl (PipeWire), else pactl
+# (PulseAudio, and PipeWire's pulse server). 5 % a press, never above 100 %.
+#
+# Usage: retrobox-volume up|down|mute
+set -euo pipefail
+
+if (($# != 1)) || [[ "$1" != "up" && "$1" != "down" && "$1" != "mute" ]]; then
+  echo "usage: $(basename "$0") up|down|mute" >&2
+  exit 1
+fi
+readonly KEY="$1"
+
+if command -v retrobox-overlay >/dev/null 2>&1; then
+  exec retrobox-overlay --volume "${KEY}"
+fi
+
+if command -v wpctl >/dev/null 2>&1 && wpctl get-volume @DEFAULT_AUDIO_SINK@ >/dev/null 2>&1; then
+  case "${KEY}" in
+    up) exec wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+ ;;
+    down) exec wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%- ;;
+    mute) exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle ;;
+  esac
+fi
+
+if command -v pactl >/dev/null 2>&1; then
+  case "${KEY}" in
+    mute) exec pactl set-sink-mute @DEFAULT_SINK@ toggle ;;
+    down) exec pactl set-sink-volume @DEFAULT_SINK@ -5% ;;
+    up)
+      # pactl goes past 100 % on its own: the first channel's volume, capped
+      volume="$(LC_ALL=C pactl get-sink-volume @DEFAULT_SINK@ | grep -o '[0-9]*%' | head -n 1)"
+      volume="${volume%\%}"
+      exec pactl set-sink-volume @DEFAULT_SINK@ "$((volume + 5 > 100 ? 100 : volume + 5))%"
+      ;;
+  esac
+fi
+
+echo "$(basename "$0"): no retrobox-overlay, wpctl nor pactl" >&2
+exit 1

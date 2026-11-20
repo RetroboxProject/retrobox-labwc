@@ -28,20 +28,20 @@
     <keybind key="A-S-Tab">
       <action name="PreviousWindow"/>
     </keybind>
-    <!-- PipeWire volume: default sink, never above 100% (-l 1.0) -->
+    <!-- Volume: Retrobox's overlay (which can show it), else wpctl or pactl; never above 100% -->
     <keybind key="XF86AudioRaiseVolume">
       <action name="Execute">
-        <command>wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+</command>
+        <command>@LABWC_DIR@/libexec/retrobox-volume up</command>
       </action>
     </keybind>
     <keybind key="XF86AudioLowerVolume">
       <action name="Execute">
-        <command>wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-</command>
+        <command>@LABWC_DIR@/libexec/retrobox-volume down</command>
       </action>
     </keybind>
     <keybind key="XF86AudioMute">
       <action name="Execute">
-        <command>wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle</command>
+        <command>@LABWC_DIR@/libexec/retrobox-volume mute</command>
       </action>
     </keybind>
     <!-- Mute microphone, optional -->

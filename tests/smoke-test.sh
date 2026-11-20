@@ -111,7 +111,7 @@ grep -q 'labwc_tty = 8' "${HOME}/.config/retrobox/retrobox.ini.d/50-labwc.ini" |
 grep -q "${DATA}/libexec/retrobox-switch-display" "${HOME}/.config/retrobox-labwc/autostart" || fail "autostart not rendered"
 grep -q "<command>foot</command>" "${HOME}/.config/retrobox-labwc/rc.xml" || fail "terminal not rendered"
 grep -q "${WORK}/core/bin/retrobox-screenshot" "${HOME}/.config/retrobox-labwc/rc.xml" || fail "screenshot not rendered"
-grep -q '@DEFAULT_AUDIO_SINK@' "${HOME}/.config/retrobox-labwc/rc.xml" || fail "wpctl placeholder was clobbered"
+grep -q '@DEFAULT_AUDIO_SOURCE@' "${HOME}/.config/retrobox-labwc/rc.xml" || fail "wpctl placeholder was clobbered"
 ! grep -q 'go2tty\|exit-tty' "${HOME}/.config/retrobox-labwc/rc.xml" || fail "leftovers in rc.xml"
 [[ "$(cat "${HOME}/.profile")" == $'# my profile\nexport FOO=1' ]] || fail "the profile was touched"
 RULE="${RETROBOX_POLKIT_DIR}/50-retrobox-labwc.rules"
